@@ -69,45 +69,45 @@
 
 PBR 的核心是反射方程 (Reflectance Equation)：
 
-\[
+$$
 L_o(\mathbf{p}, \omega_o) = \int_{\Omega} f_r(\mathbf{p}, \omega_i, \omega_o) \cdot L_i(\mathbf{p}, \omega_i) \cdot (\mathbf{n} \cdot \omega_i) \, d\omega_i
-\]
+$$
 
 其中：
-- \( L_o \)：出射辐射度 (outgoing radiance)
-- \( \omega_o \)：观察方向（从表面点到摄像机）
-- \( \omega_i \)：入射光方向
-- \( f_r \)：双向反射分布函数 (BRDF)
-- \( L_i \)：入射辐射度
-- \( \mathbf{n} \cdot \omega_i \)：Lambert 余弦项
+- $L_o$：出射辐射度 (outgoing radiance)
+- $\omega_o$：观察方向（从表面点到摄像机）
+- $\omega_i$：入射光方向
+- $f_r$：双向反射分布函数 (BRDF)
+- $L_i$：入射辐射度
+- $\mathbf{n} \cdot \omega_i$：Lambert 余弦项
 
 ### 2.2 Cook-Torrance BRDF
 
 我们将 BRDF 分解为 **漫反射** 和 **镜面反射** 两部分：
 
-\[
+$$
 f_r = k_d \cdot f_{Lambert} + k_s \cdot f_{CookTorrance}
-\]
+$$
 
 **漫反射项** (Lambertian)：
 
-\[
+$$
 f_{Lambert} = \frac{\text{albedo}}{\pi}
-\]
+$$
 
 **镜面反射项** (Cook-Torrance)：
 
-\[
+$$
 f_{CookTorrance} = \frac{D \cdot F \cdot G}{4 \cdot (\omega_o \cdot \mathbf{n}) \cdot (\omega_i \cdot \mathbf{n})}
-\]
+$$
 
 其中 D、F、G 分别是法线分布函数、菲涅尔方程和几何函数。
 
 **能量守恒**：反射光（镜面反射）+ 折射光（漫反射）不超过入射光能量：
 
-\[
+$$
 k_s = F, \quad k_d = (1 - k_s) \times (1 - \text{metallic})
-\]
+$$
 
 金属表面没有漫反射（光被完全吸收或反射），因此 `kD` 乘以 `(1 - metallic)`。
 
@@ -129,12 +129,12 @@ Lo += (kD * albedo / PI + specular) * radiance * NdotL;
 
 描述微表面法线的统计分布，决定了高光区域的大小和形状：
 
-\[
+$$
 D_{GGX}(\mathbf{n}, \mathbf{h}, \alpha) = \frac{\alpha^2}{\pi \left( (\mathbf{n} \cdot \mathbf{h})^2 (\alpha^2 - 1) + 1 \right)^2}
-\]
+$$
 
-- \( \mathbf{h} \)：半程向量 \( \mathbf{h} = \text{normalize}(\mathbf{v} + \mathbf{l}) \)
-- \( \alpha = \text{roughness}^2 \)（Disney 重映射，使滑块线性感知更自然）
+- $\mathbf{h}$：半程向量 $\mathbf{h} = \text{normalize}(\mathbf{v} + \mathbf{l})$
+- $\alpha = \text{roughness}^2$（Disney 重映射，使滑块线性感知更自然）
 
 | Roughness | 效果 |
 |-----------|------|
@@ -165,21 +165,21 @@ float DistributionGGX(vec3 N, vec3 H, float roughness)
 
 **单方向 Schlick-GGX：**
 
-\[
+$$
 G_{SchlickGGX}(\mathbf{n}, \mathbf{v}, k) = \frac{\mathbf{n} \cdot \mathbf{v}}{(\mathbf{n} \cdot \mathbf{v})(1-k) + k}
-\]
+$$
 
-其中直接光照的 \( k \) 值为：
+其中直接光照的 $k$ 值为：
 
-\[
+$$
 k_{direct} = \frac{(\text{roughness} + 1)^2}{8}
-\]
+$$
 
 **Smith's Method** 同时考虑观察方向和光照方向：
 
-\[
+$$
 G_{Smith}(\mathbf{n}, \mathbf{v}, \mathbf{l}, k) = G_{SchlickGGX}(\mathbf{n}, \mathbf{v}, k) \cdot G_{SchlickGGX}(\mathbf{n}, \mathbf{l}, k)
-\]
+$$
 
 **对应代码** (`pbr.frag` 第 66-85 行)：
 ```glsl
@@ -202,13 +202,13 @@ float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
 
 描述不同观察角度下反射光与折射光的比率：
 
-\[
+$$
 F_{Schlick}(\mathbf{h}, \mathbf{v}, F_0) = F_0 + (1 - F_0)(1 - \mathbf{h} \cdot \mathbf{v})^5
-\]
+$$
 
-- \( F_0 \)：基础反射率（0度入射角时的反射率）
-- 非金属：\( F_0 \approx 0.04 \)（大多数电介质）
-- 金属：\( F_0 = \text{albedo} \)（金属的反射色即为表面颜色）
+- $F_0$：基础反射率（0度入射角时的反射率）
+- 非金属：$F_0 \approx 0.04$（大多数电介质）
+- 金属：$F_0 = \text{albedo}$（金属的反射色即为表面颜色）
 
 通过 `metallic` 参数在两者之间插值：
 
@@ -217,7 +217,7 @@ vec3 F0 = vec3(0.04);
 F0 = mix(F0, albedo, metallic);
 ```
 
-掠射角 (grazing angle) 时 \( \mathbf{h} \cdot \mathbf{v} \to 0 \)，\( F \to 1 \)——所有表面在掠射角都趋近全反射。
+掠射角 (grazing angle) 时 $\mathbf{h} \cdot \mathbf{v} \to 0$，$F \to 1$——所有表面在掠射角都趋近全反射。
 
 **对应代码** (`pbr.frag` 第 87-90 行)：
 ```glsl
@@ -357,9 +357,9 @@ vec2 SampleSphericalMap(vec3 v)
 
 **目的**：预计算漫反射环境光。对每个法线方向 N，在半球上积分所有入射光：
 
-\[
+$$
 L_{irradiance}(\mathbf{n}) = \int_{\Omega} L_i(\omega_i) \cos\theta \sin\theta \, d\omega_i
-\]
+$$
 
 这是一个低频信号（因为漫反射本身是低频的），所以只需要很低的分辨率。
 
@@ -385,9 +385,9 @@ irradiance = π * irradiance / nrSamples;
 
 **目的**：预计算镜面反射环境光。不同粗糙度对应不同的高光扩散程度，存储在 Cubemap 的不同 Mip 级别中。
 
-\[
+$$
 L_{prefilter}(\mathbf{R}, \alpha) = \frac{\sum_{k=1}^{N} L_i(\mathbf{l}_k) \cdot (\mathbf{n} \cdot \mathbf{l}_k)}{\sum_{k=1}^{N} (\mathbf{n} \cdot \mathbf{l}_k)}
-\]
+$$
 
 **关键技术**：
 
@@ -423,15 +423,15 @@ vec3 ImportanceSampleGGX(vec2 Xi, vec3 N, float roughness)
 
 **目的**：预计算 Split-Sum 近似的第二部分。将镜面 BRDF 积分拆分为两个独立查找：
 
-\[
+$$
 \int_{\Omega} f_r \cdot L_i \cdot \cos\theta \, d\omega \approx L_{prefilter}(\mathbf{R}, \alpha) \cdot \int_{\Omega} f_r \cdot \cos\theta \, d\omega
-\]
+$$
 
 BRDF 积分部分只依赖两个变量：`NdotV` 和 `roughness`，因此可预计算为 2D 查找表：
 
-\[
+$$
 \int_{\Omega} f_r \cos\theta \, d\omega = F_0 \cdot A(\text{NdotV}, \alpha) + B(\text{NdotV}, \alpha)
-\]
+$$
 
 - **R 通道 (A)**：Fresnel 缩放因子
 - **G 通道 (B)**：Fresnel 偏移因子
@@ -448,7 +448,7 @@ vec2 IntegrateBRDF(float NdotV, float roughness)
 }
 ```
 
-**注意**：BRDF LUT 中的几何项使用 IBL 版本的 k 值 \( k_{IBL} = \frac{\alpha^2}{2} \)，不同于直接光照的 \( k_{direct} = \frac{(\alpha+1)^2}{8} \)。
+**注意**：BRDF LUT 中的几何项使用 IBL 版本的 k 值 $k_{IBL} = \frac{\alpha^2}{2}$，不同于直接光照的 $k_{direct} = \frac{(\alpha+1)^2}{8}$。
 
 **输出**：`brdfLUT` — 512×512 `GL_RG16F` 2D 纹理
 
@@ -470,9 +470,9 @@ vec3 diffuse = irradiance * albedo;
 
 注意这里使用了 `fresnelSchlickRoughness`（考虑粗糙度的修正版）：
 
-\[
+$$
 F_{Schlick,rough} = F_0 + (\max(1 - \alpha, F_0) - F_0)(1 - \cos\theta)^5
-\]
+$$
 
 粗糙表面在掠射角处反射减弱（能量散射到更宽的方向），此修正避免了粗糙表面边缘过亮的问题。
 
