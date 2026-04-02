@@ -1,0 +1,47 @@
+{
+  "window": {
+    "width": 1280,
+    "height": 720,
+    "title": "PBR Renderer",
+    "samples": 4
+  },
+  "camera": {
+    "position": [0.0, 0.0, 10.0],
+    "yaw": -90.0,
+    "pitch": 0.0,
+    "fov": 45.0,
+    "speed": 2.5,
+    "sensitivity": 0.1,
+    "near_plane": 0.1,
+    "far_plane": 100.0
+  },
+  "lights": [
+    { "position": [-10.0,  10.0, 10.0], "color": [1.0, 1.0, 1.0], "intensity": 300.0 },
+    { "position": [ 10.0,  10.0, 10.0], "color": [1.0, 1.0, 1.0], "intensity": 300.0 },
+    { "position": [-10.0, -10.0, 10.0], "color": [1.0, 1.0, 1.0], "intensity": 300.0 },
+    { "position": [ 10.0, -10.0, 10.0], "color": [1.0, 1.0, 1.0], "intensity": 300.0 }
+  ],
+  "material": {
+    "albedo": [0.5, 0.0, 0.0],
+    "metallic": 0.5,
+    "roughness": 0.5,
+    "ao": 1.0,
+    "albedo_map": "",
+    "normal_map": "",
+    "metallic_map": "",
+    "roughness_map": "",
+    "ao_map": ""
+  },
+  "environment": {
+    "hdr": "resources/textures/background.hdr",
+    "clear_color": [0.1, 0.1, 0.1],
+    "show_background": true
+  },
+  "grid": {
+    "rows": 7,
+    "cols": 7,
+    "spacing": 2.5,
+    "visible": true
+  },
+  "shader_dir": "shaders"
+}

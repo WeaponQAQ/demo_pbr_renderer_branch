@@ -1,0 +1,16 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+vcpkg_installed/
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.log
+.cache/
+compile_commands.json

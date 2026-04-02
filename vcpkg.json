@@ -1,0 +1,11 @@
+{
+  "name": "pbr-renderer",
+  "version-string": "1.0.0",
+  "description": "PBR Renderer with ImGui and OpenGL",
+  "dependencies": [
+    "glfw3",
+    "glm",
+    "assimp",
+    "nlohmann-json"
+  ]
+}
