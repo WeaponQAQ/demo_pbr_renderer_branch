@@ -38,7 +38,7 @@ Managed via **vcpkg** (submodule) and **git submodules**:
 
 ```bash
 git clone --recursive <repository-url>
-cd OpenGL
+cd target
 ```
 
 If you already cloned without `--recursive`:
