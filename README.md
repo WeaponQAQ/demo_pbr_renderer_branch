@@ -1,5 +1,5 @@
 # PBR Renderer
-
+![alt text](image.png)
 A Physically Based Rendering (PBR) demo built with OpenGL 3.3, ImGui, and Image-Based Lighting (IBL), following the [LearnOpenGL PBR tutorial](https://learnopengl.com/PBR/Theory).
 
 ## Features
