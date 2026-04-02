@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <filesystem>
 
 Shader::Shader(const char* vertexPath, const char* fragmentPath, const char* geometryPath)
 {
@@ -33,7 +34,12 @@ Shader::Shader(const char* vertexPath, const char* fragmentPath, const char* geo
         }
     }
     catch (std::ifstream::failure& e) {
-        std::cerr << "ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ: " << e.what() << std::endl;
+        namespace fs = std::filesystem;
+        std::cerr << "ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ\n"
+                  << "  vertex:   " << fs::absolute(vertexPath) << "\n"
+                  << "  fragment: " << fs::absolute(fragmentPath) << "\n"
+                  << "  CWD:      " << fs::current_path() << "\n"
+                  << "  reason:   " << e.what() << std::endl;
     }
 
     const char* vShaderCode = vertexCode.c_str();

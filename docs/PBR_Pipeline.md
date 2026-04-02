@@ -18,6 +18,7 @@
 8. [HDR 与色调映射](#8-hdr-与色调映射)
 9. [渲染管线执行流程](#9-渲染管线执行流程)
 10. [着色器文件对照表](#10-着色器文件对照表)
+11. [场景配置与动态 HDR 加载](#11-场景配置与动态-hdr-加载)
 
 ---
 
@@ -241,8 +242,25 @@ PBR 使用 **金属度/粗糙度** (Metallic/Roughness) 工作流：
 | **Normal** (法线贴图) | RGB | 像素级法线扰动，增加表面细节 |
 
 本项目支持两种输入模式：
-- **Uniform 模式**：通过 ImGui 滑块直接设置参数值
-- **纹理模式**：加载 PBR 纹理贴图（albedo, normal, metallic, roughness, ao）
+- **Uniform 模式**：通过 ImGui 滑块直接设置参数值，初始值从 `scene.json` 的 `material` 字段读取
+- **纹理模式**：在 `scene.json` 中配置 PBR 贴图路径（`albedo_map`, `normal_map`, `metallic_map`, `roughness_map`, `ao_map`）
+
+`scene.json` 材质配置示例：
+```json
+{
+  "material": {
+    "albedo": [0.5, 0.0, 0.0],
+    "metallic": 0.5,
+    "roughness": 0.5,
+    "ao": 1.0,
+    "albedo_map": "",
+    "normal_map": "",
+    "metallic_map": "",
+    "roughness_map": "",
+    "ao_map": ""
+  }
+}
+```
 
 ```glsl
 if (useTextures == 1)
@@ -509,55 +527,77 @@ albedo = pow(texture(albedoMap, TexCoords).rgb, vec3(2.2));
 
 ## 9. 渲染管线执行流程
 
+### 9.0 场景配置加载
+
+```
+SceneConfig::loadFromFile("scene.json")
+    ├── 解析 JSON 文件
+    │   ├── window   → 窗口尺寸、标题、MSAA
+    │   ├── camera   → 位置、朝向、FOV、速度
+    │   ├── lights[] → 每盏灯的位置、颜色、强度
+    │   ├── material → albedo/metallic/roughness/ao + 贴图路径
+    │   ├── environment.hdr → HDR 文件路径（不写死）
+    │   └── grid     → 球体网格行列数、间距
+    │
+    └── applyConfig() → 将配置应用到 Camera、PBRMaterial、PointLight[]
+```
+
 ### 9.1 初始化阶段
 
 ```
-PBRRenderer::init()
+PBRRenderer::init(shaderDir)
     ├── 编译加载 6 个着色器程序
-    │   ├── pbr.vert/frag          → pbrShader
-    │   ├── equirect_to_cubemap    → equirectToCubemapShader
-    │   ├── irradiance             → irradianceShader
-    │   ├── prefilter              → prefilterShader
-    │   ├── brdf                   → brdfShader
-    │   └── background             → backgroundShader
+    │   ├── pbr.vert/frag          → pbrShader_
+    │   ├── equirect_to_cubemap    → equirectToCubemapShader_
+    │   ├── irradiance             → irradianceShader_
+    │   ├── prefilter              → prefilterShader_
+    │   ├── brdf                   → brdfShader_
+    │   └── background             → backgroundShader_
     │
     ├── 绑定纹理单元
     │   ├── unit 0: irradianceMap
     │   ├── unit 1: prefilterMap
     │   ├── unit 2: brdfLUT
-    │   └── unit 3-7: 材质贴图
+    │   └── unit 3-7: 材质贴图 (albedo, normal, metallic, roughness, ao)
     │
-    ├── 生成几何体
-    │   ├── setupCube()    → 用于 Cubemap 渲染和天空盒
-    │   ├── setupSphere()  → 64×64 细分球体 (Triangle Strip)
-    │   └── setupQuad()    → 用于 BRDF LUT 全屏渲染
+    ├── setupGeometry() → 统一创建几何体
+    │   ├── Cube      → 用于 Cubemap 渲染和天空盒
+    │   ├── Sphere    → 64×64 细分 UV 球体 (Triangle Strip)
+    │   └── Quad      → 用于 BRDF LUT 全屏渲染
     │
-    └── 创建 FBO/RBO → 用于离屏渲染
+    └── 创建 captureFBO_/captureRBO_ → 用于离屏渲染
+
+SceneConfig::scanHDRFiles(directory)
+    └── 扫描目录下所有 .hdr/.exr 文件 → 填充 ImGui 下拉列表
 ```
 
 ### 9.2 IBL 预计算阶段
 
 ```
-PBRRenderer::setupIBL(hdrPath)
-    ├── loadHDRTexture()           → 加载 .hdr 文件为 GL_RGB16F 纹理
+PBRRenderer::setupIBL(hdrPath)            ← hdrPath 从 scene.json 读取
+    ├── loadHDRTexture()                  → 加载 .hdr 文件为 GL_RGB16F 纹理
     │
     └── generateIBLMaps()
         │
         ├── [Pass 1] Equirect → Cubemap (512×512 × 6 faces)
         │   ├── 绑定 HDR 纹理
-        │   ├── 6 次 FBO 渲染，每次渲染 Cubemap 一个面
+        │   ├── renderCubemapFaces() × 6 次 FBO 渲染
         │   └── 生成 Mipmap
         │
         ├── [Pass 2] Irradiance Convolution (32×32 × 6 faces)
-        │   ├── 绑定 envCubemap
-        │   └── 6 次 FBO 渲染
+        │   ├── 绑定 envCubemap_
+        │   └── renderCubemapFaces() × 6 次 FBO 渲染
         │
         ├── [Pass 3] Pre-filter (128→64→32→16→8, 5 mip × 6 faces)
-        │   ├── 绑定 envCubemap
-        │   └── 5×6 = 30 次 FBO 渲染
+        │   ├── 绑定 envCubemap_
+        │   └── renderCubemapFaces() × 5 mip × 6 面 = 30 次 FBO 渲染
         │
         └── [Pass 4] BRDF LUT (512×512, 一次全屏 quad 渲染)
             └── 纯数学计算，不依赖环境贴图
+
+PBRRenderer::reloadIBL(newHdrPath)        ← 运行时切换 HDR
+    ├── releaseIBL()                      → 释放旧 IBL 纹理
+    └── setupIBL(newHdrPath)              → 重新生成
 ```
 
 ### 9.3 每帧渲染阶段
@@ -565,23 +605,35 @@ PBRRenderer::setupIBL(hdrPath)
 ```
 主循环每帧:
     │
+    ├── 检测 HDR 切换请求 → reloadIBL()
+    │
+    ├── renderer.resize() → 同步窗口尺寸
+    │
+    ├── 更新灯光颜色 (lightColor × lightIntensity)
+    │
     ├── 清屏
     │
-    ├── renderSphereGrid() 或 renderSphere()
-    │   ├── 绑定 IBL 纹理 (irradiance, prefilter, brdfLUT)
-    │   ├── 设置光源参数
-    │   ├── 设置材质参数 (uniform 或纹理)
-    │   ├── 对每个球体:
-    │   │   ├── 计算 model 矩阵和法线矩阵
-    │   │   └── drawElements(GL_TRIANGLE_STRIP)
-    │   └── GPU 执行 pbr.frag 着色
+    ├── renderScene()
+    │   ├── setupCameraUniforms()   → projection, view, camPos
+    │   ├── setupMaterialUniforms() → useTextures, albedo, metallic, roughness, ao
+    │   ├── bindIBLTextures()       → irradiance, prefilter, brdfLUT
+    │   ├── setupLightUniforms()    → lightPositions[], lightColors[], numLights
+    │   └── 对每个球体:
+    │       ├── 计算 model 矩阵和法线矩阵
+    │       └── renderSphereGeometry() → drawElements(GL_TRIANGLE_STRIP)
     │
     ├── renderBackground()
-    │   ├── 绑定 envCubemap
+    │   ├── 绑定 envCubemap_
     │   ├── 使用 view 矩阵的旋转部分（去除平移 → 天空盒）
     │   └── 深度设为 w (gl_Position.xyww) → 始终最远
     │
-    └── ImGui 渲染叠加层
+    └── drawUI() → ImGui 渲染叠加层
+        ├── Material 面板     → albedo, metallic, roughness, ao 滑块
+        ├── Sphere Grid 面板  → rows, cols, spacing
+        ├── Lighting 面板     → 颜色、强度、每盏灯位置
+        ├── Environment 面板  → HDR 文件扫描/选择/切换、背景开关
+        ├── Camera 面板       → 位置、FOV、速度
+        └── Save/Reload Config → scene.json 读写
 ```
 
 ---
@@ -602,6 +654,63 @@ PBRRenderer::setupIBL(hdrPath)
 | `brdf.frag` | 预计算 | TexCoords (NdotV, roughness) | vec2(A, B) | BRDF 积分 LUT |
 | `background.vert` | 每帧 | 立方体顶点 | WorldPos | 移除平移的天空盒 |
 | `background.frag` | 每帧 | envCubemap | 天空盒颜色 | HDR 色调映射 |
+
+---
+
+## 11. 场景配置与动态 HDR 加载
+
+### 11.1 JSON 配置系统
+
+本项目通过 `scene.json` 外部化所有场景参数，避免硬编码。配置在启动时由 `SceneConfig::loadFromFile()` 解析，也可在运行时通过 ImGui 的 **Save Config / Reload Config** 按钮动态读写。
+
+```
+scene.json
+├── window      → 窗口尺寸、标题、MSAA 采样数
+├── camera      → 位置、yaw/pitch、FOV、移动速度、灵敏度、近远平面
+├── lights[]    → 每盏灯: position, color, intensity（数量可变）
+├── material    → albedo, metallic, roughness, ao + 5 个贴图路径
+├── environment → HDR 文件路径, 清屏色, 是否显示天空盒背景
+├── grid        → rows, cols, spacing, visible
+└── shader_dir  → 着色器目录路径
+```
+
+支持命令行指定配置文件：`PBRRenderer.exe my_scene.json`
+
+### 11.2 动态 HDR 切换
+
+HDR 环境贴图不再硬编码文件名，而是通过以下机制管理：
+
+1. **配置文件指定**：`environment.hdr` 字段指向 HDR 文件路径
+2. **运行时扫描**：`SceneConfig::scanHDRFiles()` 遍历指定目录，收集所有 `.hdr`/`.exr` 文件
+3. **ImGui 下拉选择**：用户可在 Environment 面板中选择不同的 HDR 文件
+4. **热重载**：选择新 HDR 后，`PBRRenderer::reloadIBL()` 释放旧的 IBL 纹理，重新执行完整的 IBL 预计算管线
+
+```
+用户选择新 HDR
+    │
+    ▼
+reloadIBL(newPath)
+    ├── releaseIBL()          → 删除 envCubemap_, irradianceMap_, prefilterMap_, brdfLUTTexture_
+    └── setupIBL(newPath)     → 重新执行 4-pass IBL 预计算
+        ├── Pass 1: Equirect → Cubemap
+        ├── Pass 2: Irradiance Convolution
+        ├── Pass 3: Pre-filter (5 mip levels)
+        └── Pass 4: BRDF LUT
+```
+
+### 11.3 代码架构
+
+| 类/结构体 | 文件 | 职责 |
+|-----------|------|------|
+| `SceneConfig` | `scene_config.h/cpp` | JSON 解析、序列化、HDR 文件扫描 |
+| `WindowConfig` | `scene_config.h` | 窗口参数 |
+| `CameraConfig` | `scene_config.h` | 相机参数 |
+| `LightConfig` | `scene_config.h` | 单盏灯参数（位置、颜色、强度） |
+| `MaterialConfig` | `scene_config.h` | 材质参数 + 贴图路径 |
+| `EnvironmentConfig` | `scene_config.h` | HDR 路径、清屏色、背景开关 |
+| `GridConfig` | `scene_config.h` | 球体网格参数 |
+| `AppState` | `main.cpp` | 运行时全局状态，集中管理 |
+| `PBRRenderer` | `pbr_renderer.h/cpp` | 渲染核心，提供 `reloadIBL()` 热重载 |
 
 ---
 

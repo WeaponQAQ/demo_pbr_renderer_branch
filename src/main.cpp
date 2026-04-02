@@ -11,6 +11,7 @@
 #include "camera.h"
 #include "pbr_renderer.h"
 #include "scene_config.h"
+#include "path_utils.h"
 
 #include <iostream>
 #include <vector>
@@ -347,10 +348,13 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
         g_app.bgColor[2]  = cfg.environment.clearColor.b;
         g_app.showBackground = cfg.environment.showBackground;
 
-        if (!cfg.environment.hdrPath.empty() && cfg.environment.hdrPath != renderer.currentHDR()) {
-            renderer.reloadIBL(cfg.environment.hdrPath);
-            scanHDRFiles(g_app.hdrScanDir);
-            syncSelectedHDR(cfg.environment.hdrPath);
+        if (!cfg.environment.hdrPath.empty()) {
+            std::string resolvedHDR = PathUtils::resolve(cfg.environment.hdrPath);
+            if (resolvedHDR != renderer.currentHDR()) {
+                renderer.reloadIBL(resolvedHDR);
+                scanHDRFiles(g_app.hdrScanDir);
+                syncSelectedHDR(resolvedHDR);
+            }
         }
     }
 
@@ -363,11 +367,13 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
 
 int main(int argc, char** argv)
 {
+    PathUtils::init(argv[0]);
+
     std::string configPath = "scene.json";
     if (argc > 1) configPath = argv[1];
-    g_app.configPath = configPath;
+    g_app.configPath = PathUtils::resolve(configPath);
 
-    SceneConfig cfg = SceneConfig::loadFromFile(configPath);
+    SceneConfig cfg = SceneConfig::loadFromFile(g_app.configPath);
 
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -422,7 +428,7 @@ int main(int argc, char** argv)
 
     // --- Renderer ---
     PBRRenderer renderer;
-    renderer.init(cfg.shaderDir);
+    renderer.init(PathUtils::resolve(cfg.shaderDir));
     applyConfig(cfg, renderer);
 
     g_app.screenWidth  = cfg.window.width;
@@ -430,15 +436,19 @@ int main(int argc, char** argv)
     g_app.lastX = cfg.window.width / 2.0f;
     g_app.lastY = cfg.window.height / 2.0f;
 
+    // Resolve resource directories relative to executable
+    g_app.hdrScanDir = PathUtils::resolve(g_app.hdrScanDir);
+
     // Scan HDR directory and load if configured
     scanHDRFiles(g_app.hdrScanDir);
     if (!cfg.environment.hdrPath.empty()) {
+        std::string resolvedHDR = PathUtils::resolve(cfg.environment.hdrPath);
         std::error_code ec;
-        if (std::filesystem::exists(cfg.environment.hdrPath, ec)) {
-            renderer.setupIBL(cfg.environment.hdrPath);
-            syncSelectedHDR(cfg.environment.hdrPath);
+        if (std::filesystem::exists(resolvedHDR, ec)) {
+            renderer.setupIBL(resolvedHDR);
+            syncSelectedHDR(resolvedHDR);
         } else {
-            std::cout << "[Main] HDR not found: " << cfg.environment.hdrPath << std::endl;
+            std::cout << "[Main] HDR not found: " << resolvedHDR << std::endl;
         }
     }
 
