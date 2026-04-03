@@ -17,11 +17,44 @@
 #include <vector>
 #include <string>
 #include <filesystem>
-#include <algorithm>
 
 // ============================================================
 //  Application state
 // ============================================================
+
+struct PerfStats {
+    static constexpr int HISTORY_SIZE = 120;
+    float frameTimeHistory[HISTORY_SIZE] = {};
+    int   historyIdx      = 0;
+    float cpuFrameTime    = 0.0f;
+    float avgFrameTime    = 0.0f;
+    float minFrameTime    = 999.0f;
+    float maxFrameTime    = 0.0f;
+    int   drawCalls       = 0;
+    int   instanceCount   = 0;
+    int   verticesTotal   = 0;
+
+    float gpuTimeMs       = 0.0f;
+    int   visibleSpheres  = 0;
+    int   culledSpheres   = 0;
+    int   lodCounts[3]    = {};
+
+    void push(float ms) {
+        frameTimeHistory[historyIdx] = ms;
+        historyIdx = (historyIdx + 1) % HISTORY_SIZE;
+        float sum = 0;
+        minFrameTime = 999.0f;
+        maxFrameTime = 0.0f;
+        for (int i = 0; i < HISTORY_SIZE; ++i) {
+            sum += frameTimeHistory[i];
+            if (frameTimeHistory[i] > 0.0f && frameTimeHistory[i] < minFrameTime)
+                minFrameTime = frameTimeHistory[i];
+            if (frameTimeHistory[i] > maxFrameTime)
+                maxFrameTime = frameTimeHistory[i];
+        }
+        avgFrameTime = sum / HISTORY_SIZE;
+    }
+};
 
 struct AppState {
     Camera camera;
@@ -50,6 +83,9 @@ struct AppState {
     bool  mouseControlCamera = false;
     float deltaTime = 0, lastFrame = 0;
     int   screenWidth = 1280, screenHeight = 720;
+
+    bool      useInstancing = true;
+    PerfStats perf;
 };
 
 static AppState g_app;
@@ -229,9 +265,40 @@ static void syncSelectedHDR(const std::string& currentPath)
 static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
 {
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(360, 640), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(380, 720), ImGuiCond_FirstUseEver);
     ImGui::Begin("PBR Controls");
-    ImGui::Text("FPS: %.1f  (%.2f ms)", io.Framerate, 1000.0f / io.Framerate);
+
+    // --- Performance ---
+    if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
+        auto& p = g_app.perf;
+        ImGui::Text("FPS: %.1f", io.Framerate);
+        ImGui::Text("CPU Frame: %.2f ms  (avg %.2f / min %.2f / max %.2f)",
+                     1000.0f / io.Framerate, p.avgFrameTime, p.minFrameTime, p.maxFrameTime);
+        ImGui::Text("GPU Time:  %.2f ms", p.gpuTimeMs);
+        ImGui::Separator();
+        ImGui::Text("Draw Calls:  %d", p.drawCalls);
+        ImGui::Text("Visible:     %d / %d  (culled %d)",
+                     p.visibleSpheres, p.visibleSpheres + p.culledSpheres, p.culledSpheres);
+        ImGui::Text("LOD 0 (64seg): %d  LOD 1 (32seg): %d  LOD 2 (16seg): %d",
+                     p.lodCounts[0], p.lodCounts[1], p.lodCounts[2]);
+        ImGui::Text("Vertices:    %s",
+            p.verticesTotal > 1000000 ? (std::to_string(p.verticesTotal / 1000000) + "M").c_str()
+                                      : (std::to_string(p.verticesTotal / 1000) + "K").c_str());
+
+        ImGui::PlotLines("##frametime", p.frameTimeHistory, PerfStats::HISTORY_SIZE,
+                         p.historyIdx, nullptr, 0.0f, p.maxFrameTime * 1.5f,
+                         ImVec2(0, 50));
+
+        ImGui::Checkbox("Use Instancing", &g_app.useInstancing);
+        ImGui::SameLine();
+        if (g_app.useInstancing) {
+            int activeLods = (p.lodCounts[0] > 0) + (p.lodCounts[1] > 0) + (p.lodCounts[2] > 0);
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "ON (%d draw calls)", activeLods);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "OFF (%d draw calls)",
+                               p.visibleSpheres);
+        }
+    }
     ImGui::Separator();
 
     // --- Material ---
@@ -245,9 +312,15 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
     // --- Grid ---
     if (ImGui::CollapsingHeader("Sphere Grid", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Show Grid", &g_app.gridVisible);
-        ImGui::SliderInt("Rows",     &g_app.gridRows,    1, 10);
-        ImGui::SliderInt("Columns",  &g_app.gridCols,    1, 10);
-        ImGui::SliderFloat("Spacing", &g_app.gridSpacing, 1.0f, 5.0f);
+        ImGui::SliderInt("Rows",     &g_app.gridRows,    1, 100);
+        ImGui::SliderInt("Columns",  &g_app.gridCols,    1, 100);
+        ImGui::SliderFloat("Spacing", &g_app.gridSpacing, 0.5f, 5.0f);
+        int total = g_app.gridRows * g_app.gridCols;
+        ImGui::Text("Total spheres: %d", total);
+        if (total > 5000) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                "Warning: >5000 spheres may impact performance");
+        }
     }
 
     // --- Lighting ---
@@ -279,7 +352,7 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
         char scanBuf[256];
-        strncpy(scanBuf, g_app.hdrScanDir.c_str(), sizeof(scanBuf) - 1);
+        strncpy_s(scanBuf, g_app.hdrScanDir.c_str(), sizeof(scanBuf) - 1);
         scanBuf[sizeof(scanBuf) - 1] = '\0';
         if (ImGui::InputText("##scandir", scanBuf, sizeof(scanBuf)))
             g_app.hdrScanDir = scanBuf;
@@ -478,10 +551,35 @@ int main(int argc, char** argv)
 
         renderer.renderScene(g_app.camera, g_app.material, g_app.lights,
                              g_app.gridRows, g_app.gridCols, g_app.gridSpacing,
-                             g_app.gridVisible);
+                             g_app.gridVisible, g_app.useInstancing);
 
         if (g_app.showBackground && renderer.iblReady())
             renderer.renderBackground(g_app.camera);
+
+        // Update perf stats
+        {
+            auto& p = g_app.perf;
+            p.gpuTimeMs       = renderer.gpuTimeMs();
+            p.visibleSpheres  = renderer.visibleCount();
+            p.culledSpheres   = renderer.culledCount();
+            const int* lc     = renderer.lodCounts();
+            for (int i = 0; i < 3; ++i) p.lodCounts[i] = lc[i];
+
+            int bgDraw = (g_app.showBackground && renderer.iblReady()) ? 1 : 0;
+            if (g_app.useInstancing) {
+                int activeLods = (lc[0] > 0) + (lc[1] > 0) + (lc[2] > 0);
+                p.drawCalls = activeLods + bgDraw;
+            } else {
+                p.drawCalls = p.visibleSpheres + bgDraw;
+            }
+            p.instanceCount = p.visibleSpheres;
+
+            constexpr int LOD_VERTS[] = { (64+1)*(64+1), (32+1)*(32+1), (16+1)*(16+1) };
+            p.verticesTotal = 0;
+            for (int i = 0; i < 3; ++i) p.verticesTotal += lc[i] * LOD_VERTS[i];
+
+            p.push(g_app.deltaTime * 1000.0f);
+        }
 
         // --- ImGui ---
         ImGui_ImplOpenGL3_NewFrame();

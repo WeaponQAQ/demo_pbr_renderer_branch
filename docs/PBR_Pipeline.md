@@ -19,6 +19,7 @@
 9. [渲染管线执行流程](#9-渲染管线执行流程)
 10. [着色器文件对照表](#10-着色器文件对照表)
 11. [场景配置与动态 HDR 加载](#11-场景配置与动态-hdr-加载)
+12. [渲染性能优化](#12-渲染性能优化)
 
 ---
 
@@ -46,7 +47,12 @@
 ┌─────────────────────────────────────────────────────────┐
 │                   每帧渲染阶段                            │
 │                                                         │
-│  对每个物体:                                              │
+│  球体网格                                                │
+│    ├── 视锥体剔除 → 跳过屏幕外球体                          │
+│    ├── LOD 选择   → 按距离分配 64/32/16 段网格              │
+│    └── 按 LOD 分桶 → ≤3 次 Instanced Draw Call            │
+│                                                         │
+│  对每个可见片段:                                           │
 │    ┌──────────────┐     ┌──────────────┐                │
 │    │  直接光照      │  +  │  IBL 环境光照  │                │
 │    │ (Cook-Torrance)│     │ (漫反射+镜面)  │                │
@@ -562,7 +568,9 @@ PBRRenderer::init(shaderDir)
     │
     ├── setupGeometry() → 统一创建几何体
     │   ├── Cube      → 用于 Cubemap 渲染和天空盒
-    │   ├── Sphere    → 64×64 细分 UV 球体 (Triangle Strip)
+    │   ├── Sphere LOD 0 → 64×64 细分 (4225 顶点, 近距离)
+    │   ├── Sphere LOD 1 → 32×32 细分 (1089 顶点, 中距离)
+    │   ├── Sphere LOD 2 → 16×16 细分 (289 顶点, 远距离)
     │   └── Quad      → 用于 BRDF LUT 全屏渲染
     │
     └── 创建 captureFBO_/captureRBO_ → 用于离屏渲染
@@ -614,13 +622,16 @@ PBRRenderer::reloadIBL(newHdrPath)        ← 运行时切换 HDR
     ├── 清屏
     │
     ├── renderScene()
+    │   ├── GPU Timer Query → 读取上帧结果 + 启动本帧查询
     │   ├── setupCameraUniforms()   → projection, view, camPos
     │   ├── setupMaterialUniforms() → useTextures, albedo, metallic, roughness, ao
     │   ├── bindIBLTextures()       → irradiance, prefilter, brdfLUT
     │   ├── setupLightUniforms()    → lightPositions[], lightColors[], numLights
+    │   ├── extractFrustum(VP)      → 提取 6 个裁剪平面
     │   └── 对每个球体:
-    │       ├── 计算 model 矩阵和法线矩阵
-    │       └── renderSphereGeometry() → drawElements(GL_TRIANGLE_STRIP)
+    │       ├── 视锥体剔除 → 不可见则跳过
+    │       ├── LOD 选择   → 按距离分桶 (LOD 0/1/2)
+    │       └── 按 LOD 分组 instanced draw / 逐球 draw
     │
     ├── renderBackground()
     │   ├── 绑定 envCubemap_
@@ -710,7 +721,190 @@ reloadIBL(newPath)
 | `EnvironmentConfig` | `scene_config.h` | HDR 路径、清屏色、背景开关 |
 | `GridConfig` | `scene_config.h` | 球体网格参数 |
 | `AppState` | `main.cpp` | 运行时全局状态，集中管理 |
-| `PBRRenderer` | `pbr_renderer.h/cpp` | 渲染核心，提供 `reloadIBL()` 热重载 |
+| `PerfStats` | `main.cpp` | 帧时间、GPU 时间、剔除/LOD 统计 |
+| `PBRRenderer` | `pbr_renderer.h/cpp` | 渲染核心，含 IBL 热重载、视锥剔除、LOD、GPU 计时 |
+| `SphereMesh` | `pbr_renderer.h` (内嵌) | 单个 LOD 级别的球体网格（VAO/VBO/EBO + Instance VBO） |
+
+---
+
+## 12. 渲染性能优化
+
+### 12.1 性能瓶颈分析
+
+在大规模球体网格场景中（如 50×50 = 2500 球体），最初的优化方向是通过 instancing 合批 Draw Call（从 N 次 `glDrawElements` 降为 1 次 `glDrawElementsInstanced`）。但实测表明此优化收效甚微。
+
+**原因：瓶颈在 GPU 片段着色器，而非 CPU 端 Draw Call 开销。**
+
+每个像素的 PBR 片段着色器需要执行：
+
+| 操作 | 次数/开销 |
+|------|-----------|
+| 点光源 BRDF（GGX NDF + Smith G + Fresnel） | ×4 光源 |
+| IBL 漫反射采样 (`irradianceMap`) | 1 次 Cubemap 采样 |
+| IBL 镜面反射采样 (`prefilterMap`) | 1 次 Cubemap LOD 采样 |
+| BRDF LUT 查找 (`brdfLUT`) | 1 次 2D 纹理采样 |
+| 材质纹理采样（纹理模式下） | 最多 5 次（albedo, normal, metallic, roughness, ao） |
+| 法线贴图 TBN 构建 | `dFdx`/`dFdy` 偏导计算 |
+| 色调映射 + Gamma 校正 | 2 次 `pow` |
+
+总计每像素 **10+ 次纹理采样 + 大量数学运算**。合批 Draw Call 仅减少 CPU 端的 OpenGL API 调用开销（驱动验证、状态检查），对 GPU 的顶点/片段吞吐量毫无影响。在 7×7 = 49 球体规模下，49 次 Draw Call 对现代驱动几乎没有负担。
+
+因此，真正有效的优化必须减少 GPU 需要处理的**几何量**和**片段量**。
+
+### 12.2 视锥体剔除 (Frustum Culling)
+
+**原理**：从 View-Projection 矩阵中提取 6 个裁剪平面（左、右、上、下、近、远），对每个球体执行球体-平面距离测试。若球体完全在任一平面外侧，则跳过绘制。
+
+**平面提取**（Gribb-Hartmann 方法）：
+
+设 $M = P \times V$ 为组合矩阵，$\text{row}_i$ 为其第 $i$ 行（0-indexed），则 6 个平面为：
+
+$$
+\begin{aligned}
+\text{Left}   &= \text{row}_3 + \text{row}_0 \\
+\text{Right}  &= \text{row}_3 - \text{row}_0 \\
+\text{Bottom} &= \text{row}_3 + \text{row}_1 \\
+\text{Top}    &= \text{row}_3 - \text{row}_1 \\
+\text{Near}   &= \text{row}_3 + \text{row}_2 \\
+\text{Far}    &= \text{row}_3 - \text{row}_2
+\end{aligned}
+$$
+
+每个平面 $(a, b, c, d)$ 归一化后，球心 $\mathbf{c}$ 与半径 $r$ 的判定条件：
+
+$$
+\text{visible} = \forall i \in [0,5]: \; a_i c_x + b_i c_y + c_i c_z + d_i \geq -r
+$$
+
+**性能影响**：
+
+- 相机靠近网格时，大量远处球体被剔除，可减少 **50-80%** 的几何提交
+- 剔除发生在 CPU 端，不产生 GPU 开销
+- 每个球体仅需 6 次点积运算，即使 10000 个球体也在微秒级完成
+
+**实现** (`pbr_renderer.cpp`)：
+
+```cpp
+struct Frustum { glm::vec4 planes[6]; };
+
+Frustum extractFrustum(const glm::mat4& vp) {
+    Frustum f;
+    auto row = [&](int r) {
+        return glm::vec4(vp[0][r], vp[1][r], vp[2][r], vp[3][r]);
+    };
+    f.planes[0] = row(3) + row(0);  // left
+    f.planes[1] = row(3) - row(0);  // right
+    // ... bottom, top, near, far
+    for (auto& p : f.planes)
+        p /= glm::length(glm::vec3(p));  // normalize
+    return f;
+}
+
+bool sphereInFrustum(const Frustum& f, const glm::vec3& center, float radius) {
+    for (int i = 0; i < 6; ++i)
+        if (glm::dot(glm::vec3(f.planes[i]), center) + f.planes[i].w < -radius)
+            return false;
+    return true;
+}
+```
+
+### 12.3 LOD 系统 (Level of Detail)
+
+**原理**：远处球体在屏幕上只占少量像素，使用高面数网格浪费顶点处理能力。根据球体到相机的距离，选择不同细分级别的网格。
+
+**LOD 级别配置**：
+
+| LOD | 细分段数 | 顶点数 | 索引数 | 适用距离 | 相对 LOD 0 顶点比 |
+|-----|---------|--------|--------|----------|-------------------|
+| 0 | 64×64 | 4225 | 8320 | < 25 单位 | 100% |
+| 1 | 32×32 | 1089 | 2112 | 25–60 单位 | 25.8% |
+| 2 | 16×16 | 289 | 544 | > 60 单位 | 6.8% |
+
+远处球体顶点数降低最高 **~15 倍**。由于远处球体像素覆盖面积小，视觉差异几乎不可察觉。
+
+**与 Instancing 结合**：
+
+将通过视锥剔除的球体按 LOD 级别分桶，每个 LOD 级别拥有独立的 VAO 和 Instance VBO，进行一次 `glDrawElementsInstanced` 调用。最多 3 次 Draw Call 即可渲染整个场景。
+
+```
+渲染流程:
+    ├── 对每个球体:
+    │   ├── 视锥体剔除 → 不可见则跳过
+    │   ├── 计算到相机距离 → 选择 LOD 级别
+    │   └── 写入对应 LOD 桶的 InstanceData
+    │
+    └── 对每个非空 LOD 桶:
+        ├── 上传 Instance Buffer (GL_STREAM_DRAW)
+        ├── 绑定该 LOD 的 VAO
+        └── glDrawElementsInstanced()
+```
+
+**网格创建** (`pbr_renderer.cpp`)：
+
+每个 LOD 级别在初始化时调用 `createSphereMesh()` 生成不同分辨率的 UV 球体，并通过 `setupMeshInstanceAttribs()` 配置 Instance 属性（model 矩阵 → location 3-6，材质参数 → location 7）。
+
+### 12.4 GPU Timer Query
+
+CPU 端的帧时间（`glfwGetTime()` 差值）包含了 CPU 逻辑、驱动开销、VSync 等待等成分，无法准确反映 GPU 实际渲染耗时。通过 OpenGL 的 `GL_TIME_ELAPSED` 查询可精确测量 GPU 执行命令所花费的纳秒数。
+
+**双缓冲策略**：
+
+为避免 `glGetQueryObjectui64v` 阻塞 CPU 等待 GPU 完成，使用两个 Query 对象交替工作——当前帧启动查询 A，读取上一帧查询 B 的结果（此时 B 已确保完成）。
+
+```
+帧 N:   glBeginQuery(query[0])  ...渲染...  glEndQuery(query[0])
+帧 N+1: glBeginQuery(query[1])  ...渲染...  glEndQuery(query[1])
+        glGetQueryResult(query[0]) → 读取帧 N 的 GPU 耗时（无阻塞）
+帧 N+2: glBeginQuery(query[0])  ...渲染...  glEndQuery(query[0])
+        glGetQueryResult(query[1]) → 读取帧 N+1 的 GPU 耗时（无阻塞）
+```
+
+**实现** (`pbr_renderer.cpp`)：
+
+```cpp
+// 读取上一帧的查询结果（延迟一帧，无阻塞）
+if (gpuTimerReady_) {
+    GLuint64 elapsed = 0;
+    glGetQueryObjectui64v(gpuTimerQueries_[1 - gpuQueryIdx_],
+                          GL_QUERY_RESULT, &elapsed);
+    gpuTimeMs_ = static_cast<float>(elapsed) / 1e6f;
+}
+
+// 启动本帧查询
+glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries_[gpuQueryIdx_]);
+// ... 渲染 ...
+glEndQuery(GL_TIME_ELAPSED);
+gpuQueryIdx_ = 1 - gpuQueryIdx_;
+```
+
+### 12.5 Performance 面板
+
+ImGui 的 Performance 面板展示以下实时指标：
+
+| 指标 | 说明 |
+|------|------|
+| **FPS** | 每秒帧数 |
+| **CPU Frame** | CPU 端帧时间（含 avg/min/max） |
+| **GPU Time** | GPU 实际渲染耗时（毫秒） |
+| **Draw Calls** | 当前帧的绘制调用次数 |
+| **Visible / Culled** | 通过/被剔除的球体数量 |
+| **LOD 0/1/2** | 各级 LOD 的球体分布 |
+| **Vertices** | 考虑 LOD 后的实际顶点总量 |
+
+通过对比开关 Instancing 前后的 GPU Time 和 FPS，可以直观验证"Draw Call 合批对 GPU-bound 场景无效，而视锥剔除 + LOD 才是有效优化"这一结论。
+
+### 12.6 优化效果对比
+
+以 50×50 = 2500 球体（`scene_stress_test.json`）为例，相机距离网格中心约 80 单位：
+
+| 优化策略 | 可见球体 | 顶点总量 | Draw Calls | 效果 |
+|----------|---------|---------|------------|------|
+| 无优化（逐球绘制） | 2500 | ~10.6M | 2500 | 基准 |
+| 仅 Instancing | 2500 | ~10.6M | 1 | CPU 减负，GPU 无变化 |
+| Instancing + 视锥剔除 | ~800* | ~3.4M | ≤1 | GPU 工作量降低 ~68% |
+| Instancing + 视锥剔除 + LOD | ~800* | ~0.5M* | ≤3 | GPU 工作量降低 **~95%** |
+
+*实际数值取决于相机位置和朝向
 
 ---
 
@@ -723,3 +917,4 @@ reloadIBL(newPath)
 - Brian Karis, *Real Shading in Unreal Engine 4*, SIGGRAPH 2013
 - Trowbridge & Reitz, *Average Irregularity Representation of a Rough Surface for Ray Reflection*, 1975
 - Schlick, *An Inexpensive BRDF Model for Physically-Based Rendering*, 1994
+- Gribb & Hartmann, *Fast Extraction of Viewing Frustum Planes from the World-View-Projection Matrix*, 2001

@@ -4,6 +4,7 @@ out vec4 FragColor;
 in vec2 TexCoords;
 in vec3 WorldPos;
 in vec3 Normal;
+flat in vec2 InstanceMaterial;
 
 // Material parameters
 uniform int useTextures;
@@ -29,6 +30,7 @@ uniform vec3 lightColors[4];
 uniform int  numLights;
 
 uniform vec3 camPos;
+uniform int  useInstancing;
 
 const float PI = 3.14159265359;
 
@@ -111,9 +113,15 @@ void main()
     {
         albedo    = albedoValue;
         N         = normalize(Normal);
-        metallic  = metallicValue;
-        roughness = roughnessValue;
         ao        = aoValue;
+
+        if (useInstancing == 1 && InstanceMaterial.x >= 0.0) {
+            metallic  = InstanceMaterial.x;
+            roughness = clamp(InstanceMaterial.y, 0.05, 1.0);
+        } else {
+            metallic  = metallicValue;
+            roughness = roughnessValue;
+        }
     }
 
     vec3 V = normalize(camPos - WorldPos);

@@ -1,0 +1,47 @@
+{
+  "window": {
+    "width": 1920,
+    "height": 1080,
+    "title": "PBR Stress Test - 2500 Spheres",
+    "samples": 4
+  },
+  "camera": {
+    "position": [0.0, 0.0, 80.0],
+    "yaw": -90.0,
+    "pitch": 0.0,
+    "fov": 45.0,
+    "speed": 10.0,
+    "sensitivity": 0.1,
+    "near_plane": 0.1,
+    "far_plane": 500.0
+  },
+  "lights": [
+    { "position": [-50.0,  50.0, 50.0], "color": [1.0, 1.0, 1.0], "intensity": 5000.0 },
+    { "position": [ 50.0,  50.0, 50.0], "color": [1.0, 1.0, 1.0], "intensity": 5000.0 },
+    { "position": [-50.0, -50.0, 50.0], "color": [1.0, 1.0, 1.0], "intensity": 5000.0 },
+    { "position": [ 50.0, -50.0, 50.0], "color": [1.0, 1.0, 1.0], "intensity": 5000.0 }
+  ],
+  "material": {
+    "albedo": [0.8, 0.2, 0.1],
+    "metallic": 0.5,
+    "roughness": 0.5,
+    "ao": 1.0,
+    "albedo_map": "",
+    "normal_map": "",
+    "metallic_map": "",
+    "roughness_map": "",
+    "ao_map": ""
+  },
+  "environment": {
+    "hdr": "resources/textures/background.hdr",
+    "clear_color": [0.02, 0.02, 0.03],
+    "show_background": true
+  },
+  "grid": {
+    "rows": 50,
+    "cols": 50,
+    "spacing": 2.5,
+    "visible": true
+  },
+  "shader_dir": "shaders"
+}

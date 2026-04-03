@@ -3,6 +3,7 @@
 #include <glad/glad.h>
 #include <glm/glm.hpp>
 #include <string>
+#include <unordered_map>
 
 class Shader
 {
@@ -13,6 +14,8 @@ public:
     Shader(const char* vertexPath, const char* fragmentPath, const char* geometryPath = nullptr);
 
     void use() const;
+
+    GLint loc(const std::string& name) const;
 
     void setBool(const std::string& name, bool value) const;
     void setInt(const std::string& name, int value) const;
@@ -25,4 +28,5 @@ public:
 
 private:
     void checkCompileErrors(GLuint shader, const std::string& type);
+    mutable std::unordered_map<std::string, GLint> locationCache_;
 };

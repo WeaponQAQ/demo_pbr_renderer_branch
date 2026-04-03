@@ -16,9 +16,13 @@ PBRRenderer::PBRRenderer() = default;
 
 PBRRenderer::~PBRRenderer()
 {
-    if (cubeVAO_)   { glDeleteVertexArrays(1, &cubeVAO_);   glDeleteBuffers(1, &cubeVBO_); }
-    if (sphereVAO_) { glDeleteVertexArrays(1, &sphereVAO_); glDeleteBuffers(1, &sphereVBO_); glDeleteBuffers(1, &sphereEBO_); }
-    if (quadVAO_)   { glDeleteVertexArrays(1, &quadVAO_);   glDeleteBuffers(1, &quadVBO_); }
+    if (cubeVAO_) { glDeleteVertexArrays(1, &cubeVAO_); glDeleteBuffers(1, &cubeVBO_); }
+    for (auto& lod : sphereLODs_) {
+        if (lod.vao) { glDeleteVertexArrays(1, &lod.vao); glDeleteBuffers(1, &lod.vbo); glDeleteBuffers(1, &lod.ebo); }
+        if (lod.instanceVBO) glDeleteBuffers(1, &lod.instanceVBO);
+    }
+    if (quadVAO_) { glDeleteVertexArrays(1, &quadVAO_); glDeleteBuffers(1, &quadVBO_); }
+    if (gpuTimerQueries_[0]) glDeleteQueries(2, gpuTimerQueries_);
     if (captureFBO_) { glDeleteFramebuffers(1, &captureFBO_); glDeleteRenderbuffers(1, &captureRBO_); }
     releaseIBL();
 }
@@ -62,6 +66,7 @@ bool PBRRenderer::init(const std::string& shaderDir)
     backgroundShader_.setInt("environmentMap", 0);
 
     setupGeometry();
+    glGenQueries(2, gpuTimerQueries_);
 
     glGenFramebuffers(1, &captureFBO_);
     glGenRenderbuffers(1, &captureRBO_);
@@ -246,8 +251,10 @@ glm::mat4 PBRRenderer::projectionMatrix(const Camera& camera) const
 
 void PBRRenderer::setupCameraUniforms(const Camera& camera)
 {
-    pbrShader_.setMat4("projection", projectionMatrix(camera));
-    pbrShader_.setMat4("view", camera.GetViewMatrix());
+    glm::mat4 proj = projectionMatrix(camera);
+    glm::mat4 view = camera.GetViewMatrix();
+    pbrShader_.setMat4("projection", proj);
+    pbrShader_.setMat4("view", view);
     pbrShader_.setVec3("camPos", camera.Position);
 }
 
@@ -291,43 +298,180 @@ void PBRRenderer::setupMaterialUniforms(const PBRMaterial& material)
 }
 
 // ============================================================
+//  Shared types
+// ============================================================
+
+struct InstanceData {
+    glm::mat4 model;
+    glm::vec4 material;  // (metallic, roughness, 0, 0)
+};
+
+// ============================================================
+//  Frustum culling
+// ============================================================
+
+namespace {
+
+struct Frustum { glm::vec4 planes[6]; };
+
+Frustum extractFrustum(const glm::mat4& vp)
+{
+    Frustum f;
+    auto row = [&](int r) {
+        return glm::vec4(vp[0][r], vp[1][r], vp[2][r], vp[3][r]);
+    };
+    f.planes[0] = row(3) + row(0);  // left
+    f.planes[1] = row(3) - row(0);  // right
+    f.planes[2] = row(3) + row(1);  // bottom
+    f.planes[3] = row(3) - row(1);  // top
+    f.planes[4] = row(3) + row(2);  // near
+    f.planes[5] = row(3) - row(2);  // far
+    for (auto& p : f.planes)
+        p /= glm::length(glm::vec3(p));
+    return f;
+}
+
+bool sphereInFrustum(const Frustum& f, const glm::vec3& center, float radius)
+{
+    for (int i = 0; i < 6; ++i)
+        if (glm::dot(glm::vec3(f.planes[i]), center) + f.planes[i].w < -radius)
+            return false;
+    return true;
+}
+
+constexpr float LOD_DISTANCES[] = { 25.0f, 60.0f };
+
+int selectLOD(float dist)
+{
+    if (dist < LOD_DISTANCES[0]) return 0;
+    if (dist < LOD_DISTANCES[1]) return 1;
+    return 2;
+}
+
+} // anonymous namespace
+
+// ============================================================
 //  Rendering
 // ============================================================
 
 void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                                const std::vector<PointLight>& lights,
                                int gridRows, int gridCols, float gridSpacing,
-                               bool renderGrid)
+                               bool renderGrid, bool useInstancing)
 {
+    if (gpuTimerReady_) {
+        GLuint64 elapsed = 0;
+        glGetQueryObjectui64v(gpuTimerQueries_[1 - gpuQueryIdx_],
+                              GL_QUERY_RESULT, &elapsed);
+        gpuTimeMs_ = static_cast<float>(elapsed) / 1e6f;
+    }
+
     pbrShader_.use();
     setupCameraUniforms(camera);
     setupMaterialUniforms(material);
     bindIBLTextures();
     setupLightUniforms(lights);
 
-    if (renderGrid) {
+    if (!renderGrid) {
+        visibleCount_ = culledCount_ = 0;
+        for (int i = 0; i < NUM_LODS; ++i) lodCounts_[i] = 0;
+        return;
+    }
+
+    glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries_[gpuQueryIdx_]);
+
+    glm::mat4 vp = projectionMatrix(camera) * camera.GetViewMatrix();
+    Frustum frustum = extractFrustum(vp);
+
+    visibleCount_ = 0;
+    culledCount_  = 0;
+    for (int i = 0; i < NUM_LODS; ++i) lodCounts_[i] = 0;
+
+    if (useInstancing) {
+        std::vector<InstanceData> lodBuckets[NUM_LODS];
+
         for (int row = 0; row < gridRows; ++row) {
+            float metallic = static_cast<float>(row) /
+                             static_cast<float>(std::max(gridRows - 1, 1));
+            for (int col = 0; col < gridCols; ++col) {
+                glm::vec3 pos((col - gridCols / 2) * gridSpacing,
+                              (row - gridRows / 2) * gridSpacing, 0.0f);
+
+                if (!sphereInFrustum(frustum, pos, 1.0f)) {
+                    ++culledCount_;
+                    continue;
+                }
+
+                float roughness = glm::clamp(
+                    static_cast<float>(col) / static_cast<float>(std::max(gridCols - 1, 1)),
+                    0.05f, 1.0f);
+
+                int lod = selectLOD(glm::length(camera.Position - pos));
+
+                InstanceData inst;
+                inst.model    = glm::translate(glm::mat4(1.0f), pos);
+                inst.material = glm::vec4(metallic, roughness, 0.0f, 0.0f);
+                lodBuckets[lod].push_back(inst);
+            }
+        }
+
+        pbrShader_.setInt("useInstancing", 1);
+        for (int lod = 0; lod < NUM_LODS; ++lod) {
+            lodCounts_[lod] = static_cast<int>(lodBuckets[lod].size());
+            visibleCount_ += lodCounts_[lod];
+            if (lodBuckets[lod].empty()) continue;
+
+            auto& mesh = sphereLODs_[lod];
+            glBindBuffer(GL_ARRAY_BUFFER, mesh.instanceVBO);
+            glBufferData(GL_ARRAY_BUFFER,
+                         lodBuckets[lod].size() * sizeof(InstanceData),
+                         lodBuckets[lod].data(), GL_STREAM_DRAW);
+
+            glBindVertexArray(mesh.vao);
+            glDrawElementsInstanced(GL_TRIANGLE_STRIP, mesh.indexCount,
+                                    GL_UNSIGNED_INT, 0,
+                                    static_cast<int>(lodBuckets[lod].size()));
+        }
+        pbrShader_.setInt("useInstancing", 0);
+    } else {
+        pbrShader_.setInt("useInstancing", 0);
+        for (int row = 0; row < gridRows; ++row) {
+            float metallic = static_cast<float>(row) /
+                             static_cast<float>(std::max(gridRows - 1, 1));
             if (!material.useTextures)
-                pbrShader_.setFloat("metallicValue",
-                    static_cast<float>(row) / static_cast<float>(std::max(gridRows - 1, 1)));
+                pbrShader_.setFloat("metallicValue", metallic);
 
             for (int col = 0; col < gridCols; ++col) {
+                glm::vec3 pos((col - gridCols / 2) * gridSpacing,
+                              (row - gridRows / 2) * gridSpacing, 0.0f);
+
+                if (!sphereInFrustum(frustum, pos, 1.0f)) {
+                    ++culledCount_;
+                    continue;
+                }
+
                 if (!material.useTextures)
                     pbrShader_.setFloat("roughnessValue",
-                        glm::clamp(static_cast<float>(col) / static_cast<float>(std::max(gridCols - 1, 1)),
+                        glm::clamp(static_cast<float>(col) /
+                                   static_cast<float>(std::max(gridCols - 1, 1)),
                                    0.05f, 1.0f));
 
-                glm::mat4 model = glm::translate(glm::mat4(1.0f),
-                    glm::vec3((col - gridCols / 2) * gridSpacing,
-                              (row - gridRows / 2) * gridSpacing,
-                              0.0f));
+                int lod = selectLOD(glm::length(camera.Position - pos));
+                ++lodCounts_[lod];
+                ++visibleCount_;
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), pos);
                 pbrShader_.setMat4("model", model);
                 pbrShader_.setMat3("normalMatrix",
                     glm::transpose(glm::inverse(glm::mat3(model))));
-                renderSphereGeometry();
+                renderSphereGeometry(lod);
             }
         }
     }
+
+    glEndQuery(GL_TIME_ELAPSED);
+    gpuQueryIdx_ = 1 - gpuQueryIdx_;
+    gpuTimerReady_ = true;
 }
 
 void PBRRenderer::renderSingleSphere(const Camera& camera, const PBRMaterial& material,
@@ -335,6 +479,7 @@ void PBRRenderer::renderSingleSphere(const Camera& camera, const PBRMaterial& ma
                                       const glm::mat4& modelMatrix)
 {
     pbrShader_.use();
+    pbrShader_.setInt("useInstancing", 0);
     setupCameraUniforms(camera);
     setupMaterialUniforms(material);
     bindIBLTextures();
@@ -421,55 +566,12 @@ void PBRRenderer::setupGeometry()
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, cubeStride, (void*)(6 * sizeof(float)));
     glBindVertexArray(0);
 
-    // --- Sphere (64x64 UV sphere) ---
-    constexpr unsigned int X_SEG = 64, Y_SEG = 64;
-    constexpr float PI = 3.14159265359f;
-
-    std::vector<float> sphereData;
-    sphereData.reserve((X_SEG + 1) * (Y_SEG + 1) * 8);
-    for (unsigned int x = 0; x <= X_SEG; ++x) {
-        for (unsigned int y = 0; y <= Y_SEG; ++y) {
-            float xf = static_cast<float>(x) / X_SEG;
-            float yf = static_cast<float>(y) / Y_SEG;
-            float px = std::cos(xf * 2.0f * PI) * std::sin(yf * PI);
-            float py = std::cos(yf * PI);
-            float pz = std::sin(xf * 2.0f * PI) * std::sin(yf * PI);
-
-            sphereData.insert(sphereData.end(), { px, py, pz, px, py, pz, xf, yf });
-        }
+    // --- Sphere LOD meshes ---
+    constexpr int LOD_SEGMENTS[NUM_LODS] = { 64, 32, 16 };
+    for (int i = 0; i < NUM_LODS; ++i) {
+        createSphereMesh(sphereLODs_[i], LOD_SEGMENTS[i]);
+        setupMeshInstanceAttribs(sphereLODs_[i]);
     }
-
-    std::vector<unsigned int> sphereIdx;
-    bool oddRow = false;
-    for (unsigned int y = 0; y < Y_SEG; ++y) {
-        for (unsigned int x = 0; x <= X_SEG; ++x) {
-            unsigned int cur  = oddRow ? (X_SEG - x) : x;
-            unsigned int row0 = y       * (X_SEG + 1) + cur;
-            unsigned int row1 = (y + 1) * (X_SEG + 1) + cur;
-            if (oddRow) { sphereIdx.push_back(row1); sphereIdx.push_back(row0); }
-            else        { sphereIdx.push_back(row0); sphereIdx.push_back(row1); }
-        }
-        oddRow = !oddRow;
-    }
-    sphereIndexCount_ = static_cast<unsigned int>(sphereIdx.size());
-
-    glGenVertexArrays(1, &sphereVAO_);
-    glGenBuffers(1, &sphereVBO_);
-    glGenBuffers(1, &sphereEBO_);
-    glBindVertexArray(sphereVAO_);
-    glBindBuffer(GL_ARRAY_BUFFER, sphereVBO_);
-    glBufferData(GL_ARRAY_BUFFER, sphereData.size() * sizeof(float), sphereData.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sphereEBO_);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sphereIdx.size() * sizeof(unsigned int), sphereIdx.data(), GL_STATIC_DRAW);
-
-    constexpr GLsizei sphStride = 8 * sizeof(float);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sphStride, (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sphStride, (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sphStride, (void*)(6 * sizeof(float)));
-    glBindVertexArray(0);
 
     // --- Fullscreen quad ---
     float quadVerts[] = {
@@ -495,20 +597,98 @@ void PBRRenderer::renderCubeGeometry()
 {
     glBindVertexArray(cubeVAO_);
     glDrawArrays(GL_TRIANGLES, 0, 36);
-    glBindVertexArray(0);
 }
 
-void PBRRenderer::renderSphereGeometry()
+void PBRRenderer::renderSphereGeometry(int lod)
 {
-    glBindVertexArray(sphereVAO_);
-    glDrawElements(GL_TRIANGLE_STRIP, sphereIndexCount_, GL_UNSIGNED_INT, 0);
-    glBindVertexArray(0);
+    auto& m = sphereLODs_[lod];
+    glBindVertexArray(m.vao);
+    glDrawElements(GL_TRIANGLE_STRIP, m.indexCount, GL_UNSIGNED_INT, 0);
 }
 
 void PBRRenderer::renderQuadGeometry()
 {
     glBindVertexArray(quadVAO_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// ============================================================
+//  Sphere mesh creation & instancing setup
+// ============================================================
+
+void PBRRenderer::createSphereMesh(SphereMesh& mesh, int segments)
+{
+    constexpr float PI = 3.14159265359f;
+    unsigned int xSeg = static_cast<unsigned int>(segments);
+    unsigned int ySeg = xSeg;
+
+    std::vector<float> data;
+    data.reserve((xSeg + 1) * (ySeg + 1) * 8);
+    for (unsigned int x = 0; x <= xSeg; ++x) {
+        for (unsigned int y = 0; y <= ySeg; ++y) {
+            float xf = static_cast<float>(x) / xSeg;
+            float yf = static_cast<float>(y) / ySeg;
+            float px = std::cos(xf * 2.0f * PI) * std::sin(yf * PI);
+            float py = std::cos(yf * PI);
+            float pz = std::sin(xf * 2.0f * PI) * std::sin(yf * PI);
+            data.insert(data.end(), { px, py, pz, px, py, pz, xf, yf });
+        }
+    }
+
+    std::vector<unsigned int> indices;
+    bool oddRow = false;
+    for (unsigned int y = 0; y < ySeg; ++y) {
+        for (unsigned int x = 0; x <= xSeg; ++x) {
+            unsigned int cur  = oddRow ? (xSeg - x) : x;
+            unsigned int row0 = y       * (xSeg + 1) + cur;
+            unsigned int row1 = (y + 1) * (xSeg + 1) + cur;
+            if (oddRow) { indices.push_back(row1); indices.push_back(row0); }
+            else        { indices.push_back(row0); indices.push_back(row1); }
+        }
+        oddRow = !oddRow;
+    }
+    mesh.indexCount = static_cast<unsigned int>(indices.size());
+
+    glGenVertexArrays(1, &mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glGenBuffers(1, &mesh.ebo);
+    glBindVertexArray(mesh.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+
+    constexpr GLsizei stride = 8 * sizeof(float);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)(6 * sizeof(float)));
+    glBindVertexArray(0);
+}
+
+void PBRRenderer::setupMeshInstanceAttribs(SphereMesh& mesh)
+{
+    glGenBuffers(1, &mesh.instanceVBO);
+
+    glBindVertexArray(mesh.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.instanceVBO);
+
+    for (int i = 0; i < 4; ++i) {
+        glEnableVertexAttribArray(3 + i);
+        glVertexAttribPointer(3 + i, 4, GL_FLOAT, GL_FALSE,
+                              sizeof(InstanceData),
+                              (void*)(offsetof(InstanceData, model) + sizeof(glm::vec4) * i));
+        glVertexAttribDivisor(3 + i, 1);
+    }
+
+    glEnableVertexAttribArray(7);
+    glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE,
+                          sizeof(InstanceData),
+                          (void*)offsetof(InstanceData, material));
+    glVertexAttribDivisor(7, 1);
+
     glBindVertexArray(0);
 }
 

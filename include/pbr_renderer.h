@@ -44,7 +44,7 @@ public:
     void renderScene(const Camera& camera, const PBRMaterial& material,
                      const std::vector<PointLight>& lights,
                      int gridRows, int gridCols, float gridSpacing,
-                     bool renderGrid);
+                     bool renderGrid, bool useInstancing = true);
     void renderSingleSphere(const Camera& camera, const PBRMaterial& material,
                             const std::vector<PointLight>& lights,
                             const glm::mat4& modelMatrix);
@@ -59,6 +59,11 @@ public:
 
     const std::string& currentHDR() const { return currentHDRPath_; }
 
+    float gpuTimeMs()    const { return gpuTimeMs_; }
+    int   visibleCount() const { return visibleCount_; }
+    int   culledCount()  const { return culledCount_; }
+    const int* lodCounts() const { return lodCounts_; }
+
 private:
     void setupGeometry();
     void releaseIBL();
@@ -70,10 +75,18 @@ private:
     glm::mat4 projectionMatrix(const Camera& camera) const;
 
     void renderCubeGeometry();
-    void renderSphereGeometry();
+    void renderSphereGeometry(int lod = 0);
     void renderQuadGeometry();
 
     void generateIBLMaps(unsigned int hdrTexture);
+
+    struct SphereMesh {
+        unsigned int vao = 0, vbo = 0, ebo = 0;
+        unsigned int indexCount = 0;
+        unsigned int instanceVBO = 0;
+    };
+    void createSphereMesh(SphereMesh& mesh, int segments);
+    void setupMeshInstanceAttribs(SphereMesh& mesh);
 
     Shader pbrShader_;
     Shader equirectToCubemapShader_;
@@ -88,9 +101,19 @@ private:
     unsigned int brdfLUTTexture_ = 0;
 
     unsigned int cubeVAO_ = 0, cubeVBO_ = 0;
-    unsigned int sphereVAO_ = 0, sphereVBO_ = 0, sphereEBO_ = 0;
-    unsigned int sphereIndexCount_ = 0;
+
+    static constexpr int NUM_LODS = 3;
+    SphereMesh sphereLODs_[NUM_LODS];
+
     unsigned int quadVAO_ = 0, quadVBO_ = 0;
+
+    int visibleCount_ = 0, culledCount_ = 0;
+    int lodCounts_[NUM_LODS] = {};
+
+    unsigned int gpuTimerQueries_[2] = {};
+    int gpuQueryIdx_ = 0;
+    float gpuTimeMs_ = 0.0f;
+    bool gpuTimerReady_ = false;
 
     unsigned int captureFBO_ = 0, captureRBO_ = 0;
 
