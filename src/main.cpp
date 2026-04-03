@@ -193,6 +193,7 @@ static void applyConfig(const SceneConfig& cfg, PBRRenderer& renderer)
     g_app.showBackground = cfg.environment.showBackground;
 
     renderer.resize(cfg.window.width, cfg.window.height);
+    renderer.setClipPlanes(cfg.camera.nearPlane, cfg.camera.farPlane);
 }
 
 static SceneConfig captureConfig()

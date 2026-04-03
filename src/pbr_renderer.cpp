@@ -246,7 +246,7 @@ void PBRRenderer::generateIBLMaps(unsigned int hdrTexture)
 glm::mat4 PBRRenderer::projectionMatrix(const Camera& camera) const
 {
     float aspect = static_cast<float>(screenWidth_) / static_cast<float>(screenHeight_);
-    return glm::perspective(glm::radians(camera.Zoom), aspect, 0.1f, 100.0f);
+    return glm::perspective(glm::radians(camera.Zoom), aspect, nearPlane_, farPlane_);
 }
 
 void PBRRenderer::setupCameraUniforms(const Camera& camera)

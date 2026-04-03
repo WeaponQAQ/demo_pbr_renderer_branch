@@ -53,6 +53,9 @@ public:
     unsigned int loadTexture(const char* path);
     unsigned int loadHDRTexture(const char* path);
 
+    void setClipPlanes(float nearPlane, float farPlane)
+        { nearPlane_ = nearPlane; farPlane_ = farPlane; }
+
     bool iblReady() const { return iblInitialized_; }
     int  width()    const { return screenWidth_; }
     int  height()   const { return screenHeight_; }
@@ -119,6 +122,8 @@ private:
 
     int screenWidth_  = 1280;
     int screenHeight_ = 720;
+    float nearPlane_  = 0.1f;
+    float farPlane_   = 500.0f;
     bool iblInitialized_ = false;
     std::string currentHDRPath_;
 };
