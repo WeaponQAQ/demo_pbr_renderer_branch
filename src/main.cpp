@@ -86,6 +86,8 @@ struct AppState {
 
     bool      useInstancing = true;
     PerfStats perf;
+
+    RHIContext* ctx = nullptr;
 };
 
 static AppState g_app;
@@ -96,7 +98,7 @@ static AppState g_app;
 
 static void framebufferSizeCallback(GLFWwindow*, int w, int h)
 {
-    glViewport(0, 0, w, h);
+    if (g_app.ctx) g_app.ctx->setViewport(0, 0, w, h);
     g_app.screenWidth  = w;
     g_app.screenHeight = h;
 }
@@ -143,7 +145,7 @@ static void processInput(GLFWwindow* window)
 }
 
 // ============================================================
-//  Config ↔ Runtime conversion
+//  Config <-> Runtime conversion
 // ============================================================
 
 static void applyConfig(const SceneConfig& cfg, PBRRenderer& renderer)
@@ -161,8 +163,8 @@ static void applyConfig(const SceneConfig& cfg, PBRRenderer& renderer)
     g_app.material.useTextures = cfg.material.hasTextures();
 
     if (g_app.material.useTextures) {
-        auto tryLoad = [&](const std::string& p) -> unsigned int {
-            return p.empty() ? 0 : renderer.loadTexture(p.c_str());
+        auto tryLoad = [&](const std::string& p) -> RHITexture* {
+            return p.empty() ? nullptr : renderer.loadTexture(p.c_str());
         };
         g_app.material.albedoMap    = tryLoad(cfg.material.albedoMapPath);
         g_app.material.normalMap    = tryLoad(cfg.material.normalMapPath);
@@ -403,7 +405,6 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
     ImGui::SameLine();
     if (ImGui::Button("Reload Config")) {
         auto cfg = SceneConfig::loadFromFile(g_app.configPath);
-        // Keep current renderer, just re-apply params
         g_app.camera = Camera(cfg.camera.position, glm::vec3(0,1,0),
                               cfg.camera.yaw, cfg.camera.pitch);
         g_app.camera.Zoom             = cfg.camera.fov;
@@ -495,14 +496,18 @@ int main(int argc, char** argv)
     style.Colors[ImGuiCol_Button]        = ImVec4(0.20f, 0.25f, 0.40f, 1.00f);
     style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.35f, 0.55f, 1.00f);
 
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
-    glEnable(GL_MULTISAMPLE);
+    // --- RHI Device ---
+    auto device = createOpenGLDevice();
+    auto* ctx = device->context();
+    g_app.ctx = ctx;
+
+    ctx->setDepthTest(true, CompareFunc::LessEqual);
+    ctx->setSeamlessCubemap(true);
+    ctx->setMultisample(true);
 
     // --- Renderer ---
     PBRRenderer renderer;
-    renderer.init(PathUtils::resolve(cfg.shaderDir));
+    renderer.init(device.get(), PathUtils::resolve(cfg.shaderDir));
     applyConfig(cfg, renderer);
 
     g_app.screenWidth  = cfg.window.width;
@@ -510,10 +515,8 @@ int main(int argc, char** argv)
     g_app.lastX = cfg.window.width / 2.0f;
     g_app.lastY = cfg.window.height / 2.0f;
 
-    // Resolve resource directories relative to executable
     g_app.hdrScanDir = PathUtils::resolve(g_app.hdrScanDir);
 
-    // Scan HDR directory and load if configured
     scanHDRFiles(g_app.hdrScanDir);
     if (!cfg.environment.hdrPath.empty()) {
         std::string resolvedHDR = PathUtils::resolve(cfg.environment.hdrPath);
@@ -534,7 +537,6 @@ int main(int argc, char** argv)
 
         processInput(window);
 
-        // Dynamic HDR reload
         if (g_app.hdrNeedsReload && g_app.selectedHDR >= 0) {
             renderer.reloadIBL(g_app.hdrFiles[g_app.selectedHDR]);
             g_app.hdrNeedsReload = false;
@@ -542,13 +544,12 @@ int main(int argc, char** argv)
 
         renderer.resize(g_app.screenWidth, g_app.screenHeight);
 
-        // Update light colors from UI
         glm::vec3 lc(g_app.lightColor[0], g_app.lightColor[1], g_app.lightColor[2]);
         for (auto& light : g_app.lights)
             light.color = lc * g_app.lightIntensity;
 
-        glClearColor(g_app.bgColor[0], g_app.bgColor[1], g_app.bgColor[2], 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        ctx->setViewport(0, 0, g_app.screenWidth, g_app.screenHeight);
+        ctx->clear(g_app.bgColor[0], g_app.bgColor[1], g_app.bgColor[2], 1.0f, 1.0f);
 
         renderer.renderScene(g_app.camera, g_app.material, g_app.lights,
                              g_app.gridRows, g_app.gridCols, g_app.gridSpacing,

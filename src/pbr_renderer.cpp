@@ -1,12 +1,26 @@
 #include "pbr_renderer.h"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <cmath>
+#include <algorithm>
+#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+// ============================================================
+//  Shared types
+// ============================================================
+
+struct InstanceData {
+    glm::mat4 model;
+    glm::vec4 material;  // (metallic, roughness, 0, 0)
+};
 
 // ============================================================
 //  Lifecycle
@@ -14,62 +28,72 @@
 
 PBRRenderer::PBRRenderer() = default;
 
-PBRRenderer::~PBRRenderer()
-{
-    if (cubeVAO_) { glDeleteVertexArrays(1, &cubeVAO_); glDeleteBuffers(1, &cubeVBO_); }
-    for (auto& lod : sphereLODs_) {
-        if (lod.vao) { glDeleteVertexArrays(1, &lod.vao); glDeleteBuffers(1, &lod.vbo); glDeleteBuffers(1, &lod.ebo); }
-        if (lod.instanceVBO) glDeleteBuffers(1, &lod.instanceVBO);
-    }
-    if (quadVAO_) { glDeleteVertexArrays(1, &quadVAO_); glDeleteBuffers(1, &quadVBO_); }
-    if (gpuTimerQueries_[0]) glDeleteQueries(2, gpuTimerQueries_);
-    if (captureFBO_) { glDeleteFramebuffers(1, &captureFBO_); glDeleteRenderbuffers(1, &captureRBO_); }
-    releaseIBL();
-}
+PBRRenderer::~PBRRenderer() = default;
 
 void PBRRenderer::releaseIBL()
 {
-    auto del = [](unsigned int& tex) { if (tex) { glDeleteTextures(1, &tex); tex = 0; } };
-    del(envCubemap_);
-    del(irradianceMap_);
-    del(prefilterMap_);
-    del(brdfLUTTexture_);
+    envCubemap_.reset();
+    irradianceMap_.reset();
+    prefilterMap_.reset();
+    brdfLUTTexture_.reset();
     iblInitialized_ = false;
     currentHDRPath_.clear();
 }
 
-bool PBRRenderer::init(const std::string& shaderDir)
+static std::string readFile(const std::string& path)
 {
-    auto load = [&](const std::string& name) {
-        return Shader((shaderDir + "/" + name + ".vert").c_str(),
-                      (shaderDir + "/" + name + ".frag").c_str());
+    std::ifstream f;
+    f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    try {
+        f.open(path);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    } catch (std::ifstream::failure& e) {
+        std::cerr << "ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ\n"
+                  << "  path:   " << std::filesystem::absolute(path) << "\n"
+                  << "  CWD:    " << std::filesystem::current_path() << "\n"
+                  << "  reason: " << e.what() << std::endl;
+        return {};
+    }
+}
+
+bool PBRRenderer::init(RHIDevice* device, const std::string& shaderDir)
+{
+    device_ = device;
+    ctx_    = device_->context();
+
+    auto loadShader = [&](const std::string& name) -> std::unique_ptr<RHIShader> {
+        ShaderDesc desc;
+        desc.vertexSrc   = readFile(shaderDir + "/" + name + ".vert");
+        desc.fragmentSrc = readFile(shaderDir + "/" + name + ".frag");
+        return device_->createShader(desc);
     };
 
-    pbrShader_                = load("pbr");
-    equirectToCubemapShader_  = load("equirectangular_to_cubemap");
-    irradianceShader_         = load("irradiance");
-    prefilterShader_          = load("prefilter");
-    brdfShader_               = load("brdf");
-    backgroundShader_         = load("background");
+    pbrShader_               = loadShader("pbr");
+    equirectToCubemapShader_ = loadShader("equirectangular_to_cubemap");
+    irradianceShader_        = loadShader("irradiance");
+    prefilterShader_         = loadShader("prefilter");
+    brdfShader_              = loadShader("brdf");
+    backgroundShader_        = loadShader("background");
 
-    pbrShader_.use();
-    pbrShader_.setInt("irradianceMap", 0);
-    pbrShader_.setInt("prefilterMap",  1);
-    pbrShader_.setInt("brdfLUT",       2);
-    pbrShader_.setInt("albedoMap",     3);
-    pbrShader_.setInt("normalMap",     4);
-    pbrShader_.setInt("metallicMap",   5);
-    pbrShader_.setInt("roughnessMap",  6);
-    pbrShader_.setInt("aoMap",         7);
+    ctx_->bindShader(pbrShader_.get());
+    pbrShader_->setInt("irradianceMap", 0);
+    pbrShader_->setInt("prefilterMap",  1);
+    pbrShader_->setInt("brdfLUT",       2);
+    pbrShader_->setInt("albedoMap",     3);
+    pbrShader_->setInt("normalMap",     4);
+    pbrShader_->setInt("metallicMap",   5);
+    pbrShader_->setInt("roughnessMap",  6);
+    pbrShader_->setInt("aoMap",         7);
 
-    backgroundShader_.use();
-    backgroundShader_.setInt("environmentMap", 0);
+    ctx_->bindShader(backgroundShader_.get());
+    backgroundShader_->setInt("environmentMap", 0);
 
     setupGeometry();
-    glGenQueries(2, gpuTimerQueries_);
 
-    glGenFramebuffers(1, &captureFBO_);
-    glGenRenderbuffers(1, &captureRBO_);
+    timerQuery_ = device_->createTimerQuery();
+    captureFBO_ = device_->createFramebuffer({ 0, 0, true });
 
     return true;
 }
@@ -86,13 +110,16 @@ void PBRRenderer::resize(int width, int height)
 
 void PBRRenderer::setupIBL(const std::string& hdrPath)
 {
-    unsigned int hdrTexture = loadHDRTexture(hdrPath.c_str());
-    if (hdrTexture == 0) {
+    RHITexture* hdrTex = loadHDRTexture(hdrPath.c_str());
+    if (!hdrTex) {
         std::cerr << "[PBRRenderer] Failed to load HDR: " << hdrPath << std::endl;
         return;
     }
-    generateIBLMaps(hdrTexture);
-    glDeleteTextures(1, &hdrTexture);
+    generateIBLMaps(hdrTex);
+
+    // The HDR texture was stored in loadedTextures_; remove it to free memory
+    if (!loadedTextures_.empty()) loadedTextures_.pop_back();
+
     iblInitialized_ = true;
     currentHDRPath_ = hdrPath;
     std::cout << "[PBRRenderer] IBL loaded: " << hdrPath << std::endl;
@@ -106,7 +133,7 @@ void PBRRenderer::reloadIBL(const std::string& hdrPath)
     setupIBL(hdrPath);
 }
 
-void PBRRenderer::generateIBLMaps(unsigned int hdrTexture)
+void PBRRenderer::generateIBLMaps(RHITexture* hdrTexture)
 {
     glm::mat4 captureProjection = glm::perspective(glm::radians(90.0f), 1.0f, 0.1f, 10.0f);
     glm::mat4 captureViews[] = {
@@ -118,129 +145,135 @@ void PBRRenderer::generateIBLMaps(unsigned int hdrTexture)
         glm::lookAt(glm::vec3(0), glm::vec3( 0, 0,-1), glm::vec3(0,-1, 0))
     };
 
-    auto renderCubemapFaces = [&](Shader& shader, unsigned int cubemap,
-                                  unsigned int size, int mipLevel = 0) {
-        glViewport(0, 0, size, size);
-        for (unsigned int i = 0; i < 6; ++i) {
-            shader.setMat4("view", captureViews[i]);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, cubemap, mipLevel);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    auto renderCubemapFaces = [&](RHIShader* shader, RHITexture* cubemap,
+                                  int size, int mipLevel = 0) {
+        ctx_->setViewport(0, 0, size, size);
+        for (int i = 0; i < 6; ++i) {
+            shader->setMat4("view", glm::value_ptr(captureViews[i]));
+            ctx_->attachCubeFace(captureFBO_.get(), cubemap, i, mipLevel);
+            ctx_->clear(0, 0, 0, 1, 1.0f);
             renderCubeGeometry();
         }
     };
 
     // --- Environment cubemap (512x512) ---
-    constexpr unsigned int ENV_SIZE = 512;
-    glGenTextures(1, &envCubemap_);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap_);
-    for (unsigned int i = 0; i < 6; ++i)
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB16F,
-                     ENV_SIZE, ENV_SIZE, 0, GL_RGB, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    constexpr int ENV_SIZE = 512;
+    {
+        TextureDesc desc;
+        desc.type      = TextureType::TextureCubeMap;
+        desc.format    = TextureFormat::RGB16F;
+        desc.width     = ENV_SIZE;
+        desc.height    = ENV_SIZE;
+        desc.wrapS     = WrapMode::ClampToEdge;
+        desc.wrapT     = WrapMode::ClampToEdge;
+        desc.wrapR     = WrapMode::ClampToEdge;
+        desc.minFilter = FilterMode::LinearMipLinear;
+        desc.magFilter = FilterMode::Linear;
+        envCubemap_ = device_->createTexture(desc);
+    }
 
-    equirectToCubemapShader_.use();
-    equirectToCubemapShader_.setInt("equirectangularMap", 0);
-    equirectToCubemapShader_.setMat4("projection", captureProjection);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, hdrTexture);
+    ctx_->bindShader(equirectToCubemapShader_.get());
+    equirectToCubemapShader_->setInt("equirectangularMap", 0);
+    equirectToCubemapShader_->setMat4("projection", glm::value_ptr(captureProjection));
+    ctx_->bindTexture(0, hdrTexture);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO_);
-    renderCubemapFaces(equirectToCubemapShader_, envCubemap_, ENV_SIZE);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ctx_->beginPass(captureFBO_.get());
+    renderCubemapFaces(equirectToCubemapShader_.get(), envCubemap_.get(), ENV_SIZE);
+    ctx_->endPass();
 
-    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap_);
-    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    envCubemap_->generateMipmaps();
 
     // --- Irradiance map (32x32) ---
-    constexpr unsigned int IRR_SIZE = 32;
-    glGenTextures(1, &irradianceMap_);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, irradianceMap_);
-    for (unsigned int i = 0; i < 6; ++i)
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB16F,
-                     IRR_SIZE, IRR_SIZE, 0, GL_RGB, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    constexpr int IRR_SIZE = 32;
+    {
+        TextureDesc desc;
+        desc.type      = TextureType::TextureCubeMap;
+        desc.format    = TextureFormat::RGB16F;
+        desc.width     = IRR_SIZE;
+        desc.height    = IRR_SIZE;
+        desc.wrapS     = WrapMode::ClampToEdge;
+        desc.wrapT     = WrapMode::ClampToEdge;
+        desc.wrapR     = WrapMode::ClampToEdge;
+        desc.minFilter = FilterMode::Linear;
+        desc.magFilter = FilterMode::Linear;
+        irradianceMap_ = device_->createTexture(desc);
+    }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO_);
-    glBindRenderbuffer(GL_RENDERBUFFER, captureRBO_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, IRR_SIZE, IRR_SIZE);
+    captureFBO_->resizeDepth(IRR_SIZE, IRR_SIZE);
 
-    irradianceShader_.use();
-    irradianceShader_.setInt("environmentMap", 0);
-    irradianceShader_.setMat4("projection", captureProjection);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap_);
+    ctx_->bindShader(irradianceShader_.get());
+    irradianceShader_->setInt("environmentMap", 0);
+    irradianceShader_->setMat4("projection", glm::value_ptr(captureProjection));
+    ctx_->bindTexture(0, envCubemap_.get());
 
-    renderCubemapFaces(irradianceShader_, irradianceMap_, IRR_SIZE);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ctx_->beginPass(captureFBO_.get());
+    renderCubemapFaces(irradianceShader_.get(), irradianceMap_.get(), IRR_SIZE);
+    ctx_->endPass();
 
     // --- Prefilter map (128x128, 5 mip levels) ---
-    constexpr unsigned int PF_SIZE = 128;
-    constexpr unsigned int PF_MIP_LEVELS = 5;
-    glGenTextures(1, &prefilterMap_);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, prefilterMap_);
-    for (unsigned int i = 0; i < 6; ++i)
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB16F,
-                     PF_SIZE, PF_SIZE, 0, GL_RGB, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    constexpr int PF_SIZE = 128;
+    constexpr int PF_MIP_LEVELS = 5;
+    {
+        TextureDesc desc;
+        desc.type      = TextureType::TextureCubeMap;
+        desc.format    = TextureFormat::RGB16F;
+        desc.width     = PF_SIZE;
+        desc.height    = PF_SIZE;
+        desc.mipmaps   = true;
+        desc.wrapS     = WrapMode::ClampToEdge;
+        desc.wrapT     = WrapMode::ClampToEdge;
+        desc.wrapR     = WrapMode::ClampToEdge;
+        desc.minFilter = FilterMode::LinearMipLinear;
+        desc.magFilter = FilterMode::Linear;
+        prefilterMap_ = device_->createTexture(desc);
+    }
 
-    prefilterShader_.use();
-    prefilterShader_.setInt("environmentMap", 0);
-    prefilterShader_.setMat4("projection", captureProjection);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap_);
+    ctx_->bindShader(prefilterShader_.get());
+    prefilterShader_->setInt("environmentMap", 0);
+    prefilterShader_->setMat4("projection", glm::value_ptr(captureProjection));
+    ctx_->bindTexture(0, envCubemap_.get());
 
-    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO_);
-    for (unsigned int mip = 0; mip < PF_MIP_LEVELS; ++mip) {
-        unsigned int mipSize = static_cast<unsigned int>(PF_SIZE * std::pow(0.5, mip));
-        glBindRenderbuffer(GL_RENDERBUFFER, captureRBO_);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, mipSize, mipSize);
+    ctx_->beginPass(captureFBO_.get());
+    for (int mip = 0; mip < PF_MIP_LEVELS; ++mip) {
+        int mipSize = static_cast<int>(PF_SIZE * std::pow(0.5, mip));
+        captureFBO_->resizeDepth(mipSize, mipSize);
 
         float roughness = static_cast<float>(mip) / static_cast<float>(PF_MIP_LEVELS - 1);
-        prefilterShader_.setFloat("roughness", roughness);
-        renderCubemapFaces(prefilterShader_, prefilterMap_, mipSize, mip);
+        prefilterShader_->setFloat("roughness", roughness);
+        renderCubemapFaces(prefilterShader_.get(), prefilterMap_.get(), mipSize, mip);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ctx_->endPass();
 
     // --- BRDF LUT (512x512) ---
-    constexpr unsigned int BRDF_SIZE = 512;
-    glGenTextures(1, &brdfLUTTexture_);
-    glBindTexture(GL_TEXTURE_2D, brdfLUTTexture_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, BRDF_SIZE, BRDF_SIZE, 0, GL_RG, GL_FLOAT, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    constexpr int BRDF_SIZE = 512;
+    {
+        TextureDesc desc;
+        desc.type      = TextureType::Texture2D;
+        desc.format    = TextureFormat::RG16F;
+        desc.width     = BRDF_SIZE;
+        desc.height    = BRDF_SIZE;
+        desc.wrapS     = WrapMode::ClampToEdge;
+        desc.wrapT     = WrapMode::ClampToEdge;
+        desc.minFilter = FilterMode::Linear;
+        desc.magFilter = FilterMode::Linear;
+        brdfLUTTexture_ = device_->createTexture(desc);
+    }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO_);
-    glBindRenderbuffer(GL_RENDERBUFFER, captureRBO_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, BRDF_SIZE, BRDF_SIZE);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, brdfLUTTexture_, 0);
+    captureFBO_->resizeDepth(BRDF_SIZE, BRDF_SIZE);
 
-    glViewport(0, 0, BRDF_SIZE, BRDF_SIZE);
-    brdfShader_.use();
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    ctx_->beginPass(captureFBO_.get());
+    ctx_->attachTexture2D(captureFBO_.get(), brdfLUTTexture_.get(), 0);
+    ctx_->setViewport(0, 0, BRDF_SIZE, BRDF_SIZE);
+    ctx_->bindShader(brdfShader_.get());
+    ctx_->clear(0, 0, 0, 1, 1.0f);
     renderQuadGeometry();
+    ctx_->endPass();
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, screenWidth_, screenHeight_);
+    ctx_->setViewport(0, 0, screenWidth_, screenHeight_);
 }
 
 // ============================================================
-//  Uniform helpers (eliminate duplication)
+//  Uniform helpers
 // ============================================================
 
 glm::mat4 PBRRenderer::projectionMatrix(const Camera& camera) const
@@ -253,58 +286,46 @@ void PBRRenderer::setupCameraUniforms(const Camera& camera)
 {
     glm::mat4 proj = projectionMatrix(camera);
     glm::mat4 view = camera.GetViewMatrix();
-    pbrShader_.setMat4("projection", proj);
-    pbrShader_.setMat4("view", view);
-    pbrShader_.setVec3("camPos", camera.Position);
+    pbrShader_->setMat4("projection", glm::value_ptr(proj));
+    pbrShader_->setMat4("view", glm::value_ptr(view));
+    pbrShader_->setVec3("camPos", glm::value_ptr(camera.Position));
 }
 
 void PBRRenderer::bindIBLTextures()
 {
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, irradianceMap_);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, prefilterMap_);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, brdfLUTTexture_);
+    ctx_->bindTexture(0, irradianceMap_.get());
+    ctx_->bindTexture(1, prefilterMap_.get());
+    ctx_->bindTexture(2, brdfLUTTexture_.get());
 }
 
 void PBRRenderer::setupLightUniforms(const std::vector<PointLight>& lights)
 {
     int n = static_cast<int>(std::min(lights.size(), size_t(4)));
-    pbrShader_.setInt("numLights", n);
+    pbrShader_->setInt("numLights", n);
     for (int i = 0; i < n; ++i) {
         std::string idx = std::to_string(i);
-        pbrShader_.setVec3("lightPositions[" + idx + "]", lights[i].position);
-        pbrShader_.setVec3("lightColors[" + idx + "]",    lights[i].color);
+        pbrShader_->setVec3("lightPositions[" + idx + "]", glm::value_ptr(lights[i].position));
+        pbrShader_->setVec3("lightColors[" + idx + "]",    glm::value_ptr(lights[i].color));
     }
 }
 
 void PBRRenderer::setupMaterialUniforms(const PBRMaterial& material)
 {
-    pbrShader_.setInt("useTextures", material.useTextures ? 1 : 0);
+    pbrShader_->setInt("useTextures", material.useTextures ? 1 : 0);
 
     if (material.useTextures) {
-        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, material.albedoMap);
-        glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, material.normalMap);
-        glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, material.metallicMap);
-        glActiveTexture(GL_TEXTURE6); glBindTexture(GL_TEXTURE_2D, material.roughnessMap);
-        glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, material.aoMap);
+        if (material.albedoMap)    ctx_->bindTexture(3, material.albedoMap);
+        if (material.normalMap)    ctx_->bindTexture(4, material.normalMap);
+        if (material.metallicMap)  ctx_->bindTexture(5, material.metallicMap);
+        if (material.roughnessMap) ctx_->bindTexture(6, material.roughnessMap);
+        if (material.aoMap)        ctx_->bindTexture(7, material.aoMap);
     } else {
-        pbrShader_.setVec3("albedoValue",    material.albedo);
-        pbrShader_.setFloat("metallicValue", material.metallic);
-        pbrShader_.setFloat("roughnessValue", material.roughness);
-        pbrShader_.setFloat("aoValue",       material.ao);
+        pbrShader_->setVec3("albedoValue",    glm::value_ptr(material.albedo));
+        pbrShader_->setFloat("metallicValue", material.metallic);
+        pbrShader_->setFloat("roughnessValue", material.roughness);
+        pbrShader_->setFloat("aoValue",       material.ao);
     }
 }
-
-// ============================================================
-//  Shared types
-// ============================================================
-
-struct InstanceData {
-    glm::mat4 model;
-    glm::vec4 material;  // (metallic, roughness, 0, 0)
-};
 
 // ============================================================
 //  Frustum culling
@@ -320,12 +341,12 @@ Frustum extractFrustum(const glm::mat4& vp)
     auto row = [&](int r) {
         return glm::vec4(vp[0][r], vp[1][r], vp[2][r], vp[3][r]);
     };
-    f.planes[0] = row(3) + row(0);  // left
-    f.planes[1] = row(3) - row(0);  // right
-    f.planes[2] = row(3) + row(1);  // bottom
-    f.planes[3] = row(3) - row(1);  // top
-    f.planes[4] = row(3) + row(2);  // near
-    f.planes[5] = row(3) - row(2);  // far
+    f.planes[0] = row(3) + row(0);
+    f.planes[1] = row(3) - row(0);
+    f.planes[2] = row(3) + row(1);
+    f.planes[3] = row(3) - row(1);
+    f.planes[4] = row(3) + row(2);
+    f.planes[5] = row(3) - row(2);
     for (auto& p : f.planes)
         p /= glm::length(glm::vec3(p));
     return f;
@@ -359,14 +380,9 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                                int gridRows, int gridCols, float gridSpacing,
                                bool renderGrid, bool useInstancing)
 {
-    if (gpuTimerReady_) {
-        GLuint64 elapsed = 0;
-        glGetQueryObjectui64v(gpuTimerQueries_[1 - gpuQueryIdx_],
-                              GL_QUERY_RESULT, &elapsed);
-        gpuTimeMs_ = static_cast<float>(elapsed) / 1e6f;
-    }
+    gpuTimeMs_ = ctx_->getTimerResultMs(timerQuery_.get());
 
-    pbrShader_.use();
+    ctx_->bindShader(pbrShader_.get());
     setupCameraUniforms(camera);
     setupMaterialUniforms(material);
     bindIBLTextures();
@@ -378,7 +394,7 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
         return;
     }
 
-    glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries_[gpuQueryIdx_]);
+    ctx_->beginTimerQuery(timerQuery_.get());
 
     glm::mat4 vp = projectionMatrix(camera) * camera.GetViewMatrix();
     Frustum frustum = extractFrustum(vp);
@@ -415,31 +431,29 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
             }
         }
 
-        pbrShader_.setInt("useInstancing", 1);
+        pbrShader_->setInt("useInstancing", 1);
         for (int lod = 0; lod < NUM_LODS; ++lod) {
             lodCounts_[lod] = static_cast<int>(lodBuckets[lod].size());
             visibleCount_ += lodCounts_[lod];
             if (lodBuckets[lod].empty()) continue;
 
-            auto& mesh = sphereLODs_[lod];
-            glBindBuffer(GL_ARRAY_BUFFER, mesh.instanceVBO);
-            glBufferData(GL_ARRAY_BUFFER,
-                         lodBuckets[lod].size() * sizeof(InstanceData),
-                         lodBuckets[lod].data(), GL_STREAM_DRAW);
+            sphereLODs_[lod].instanceBuffer->update(
+                lodBuckets[lod].data(),
+                lodBuckets[lod].size() * sizeof(InstanceData));
 
-            glBindVertexArray(mesh.vao);
-            glDrawElementsInstanced(GL_TRIANGLE_STRIP, mesh.indexCount,
-                                    GL_UNSIGNED_INT, 0,
-                                    static_cast<int>(lodBuckets[lod].size()));
+            ctx_->bindVertexInput(sphereLODs_[lod].vertexInput.get());
+            ctx_->drawIndexedInstanced(PrimitiveType::TriangleStrip,
+                                       sphereLODs_[lod].indexCount,
+                                       static_cast<int>(lodBuckets[lod].size()));
         }
-        pbrShader_.setInt("useInstancing", 0);
+        pbrShader_->setInt("useInstancing", 0);
     } else {
-        pbrShader_.setInt("useInstancing", 0);
+        pbrShader_->setInt("useInstancing", 0);
         for (int row = 0; row < gridRows; ++row) {
             float metallic = static_cast<float>(row) /
                              static_cast<float>(std::max(gridRows - 1, 1));
             if (!material.useTextures)
-                pbrShader_.setFloat("metallicValue", metallic);
+                pbrShader_->setFloat("metallicValue", metallic);
 
             for (int col = 0; col < gridCols; ++col) {
                 glm::vec3 pos((col - gridCols / 2) * gridSpacing,
@@ -451,7 +465,7 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                 }
 
                 if (!material.useTextures)
-                    pbrShader_.setFloat("roughnessValue",
+                    pbrShader_->setFloat("roughnessValue",
                         glm::clamp(static_cast<float>(col) /
                                    static_cast<float>(std::max(gridCols - 1, 1)),
                                    0.05f, 1.0f));
@@ -461,43 +475,42 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                 ++visibleCount_;
 
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), pos);
-                pbrShader_.setMat4("model", model);
-                pbrShader_.setMat3("normalMatrix",
-                    glm::transpose(glm::inverse(glm::mat3(model))));
+                pbrShader_->setMat4("model", glm::value_ptr(model));
+                glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(model)));
+                pbrShader_->setMat3("normalMatrix", glm::value_ptr(normalMat));
                 renderSphereGeometry(lod);
             }
         }
     }
 
-    glEndQuery(GL_TIME_ELAPSED);
-    gpuQueryIdx_ = 1 - gpuQueryIdx_;
-    gpuTimerReady_ = true;
+    ctx_->endTimerQuery(timerQuery_.get());
 }
 
 void PBRRenderer::renderSingleSphere(const Camera& camera, const PBRMaterial& material,
                                       const std::vector<PointLight>& lights,
                                       const glm::mat4& modelMatrix)
 {
-    pbrShader_.use();
-    pbrShader_.setInt("useInstancing", 0);
+    ctx_->bindShader(pbrShader_.get());
+    pbrShader_->setInt("useInstancing", 0);
     setupCameraUniforms(camera);
     setupMaterialUniforms(material);
     bindIBLTextures();
     setupLightUniforms(lights);
 
-    pbrShader_.setMat4("model", modelMatrix);
-    pbrShader_.setMat3("normalMatrix",
-        glm::transpose(glm::inverse(glm::mat3(modelMatrix))));
+    pbrShader_->setMat4("model", glm::value_ptr(modelMatrix));
+    glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+    pbrShader_->setMat3("normalMatrix", glm::value_ptr(normalMat));
     renderSphereGeometry();
 }
 
 void PBRRenderer::renderBackground(const Camera& camera)
 {
-    backgroundShader_.use();
-    backgroundShader_.setMat4("projection", projectionMatrix(camera));
-    backgroundShader_.setMat4("view", camera.GetViewMatrix());
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap_);
+    ctx_->bindShader(backgroundShader_.get());
+    glm::mat4 proj = projectionMatrix(camera);
+    glm::mat4 view = camera.GetViewMatrix();
+    backgroundShader_->setMat4("projection", glm::value_ptr(proj));
+    backgroundShader_->setMat4("view", glm::value_ptr(view));
+    ctx_->bindTexture(0, envCubemap_.get());
     renderCubeGeometry();
 }
 
@@ -552,26 +565,26 @@ void PBRRenderer::setupGeometry()
         -1.0f, 1.0f,-1.0f, 0.0f, 1.0f, 0.0f, 0.0f,1.0f
     };
 
-    glGenVertexArrays(1, &cubeVAO_);
-    glGenBuffers(1, &cubeVBO_);
-    glBindVertexArray(cubeVAO_);
-    glBindBuffer(GL_ARRAY_BUFFER, cubeVBO_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVerts), cubeVerts, GL_STATIC_DRAW);
-    constexpr GLsizei cubeStride = 8 * sizeof(float);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, cubeStride, (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, cubeStride, (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, cubeStride, (void*)(6 * sizeof(float)));
-    glBindVertexArray(0);
+    constexpr size_t cubeStride = 8 * sizeof(float);
+    cubeVBO_ = device_->createBuffer({
+        BufferType::Vertex, BufferAccess::Static,
+        sizeof(cubeVerts), cubeVerts
+    });
+
+    VertexInputDesc cubeVI;
+    cubeVI.bindings    = { { cubeStride, 0 } };
+    cubeVI.attributes  = {
+        { 0, 3, 0, 0 },
+        { 1, 3, 0, 3 * sizeof(float) },
+        { 2, 2, 0, 6 * sizeof(float) }
+    };
+    cubeVI.vertexBuffers = { cubeVBO_.get() };
+    cubeInput_ = device_->createVertexInput(cubeVI);
 
     // --- Sphere LOD meshes ---
     constexpr int LOD_SEGMENTS[NUM_LODS] = { 64, 32, 16 };
-    for (int i = 0; i < NUM_LODS; ++i) {
+    for (int i = 0; i < NUM_LODS; ++i)
         createSphereMesh(sphereLODs_[i], LOD_SEGMENTS[i]);
-        setupMeshInstanceAttribs(sphereLODs_[i]);
-    }
 
     // --- Fullscreen quad ---
     float quadVerts[] = {
@@ -581,39 +594,42 @@ void PBRRenderer::setupGeometry()
          1.0f,-1.0f, 0.0f, 1.0f,0.0f,
     };
 
-    glGenVertexArrays(1, &quadVAO_);
-    glGenBuffers(1, &quadVBO_);
-    glBindVertexArray(quadVAO_);
-    glBindBuffer(GL_ARRAY_BUFFER, quadVBO_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-    glBindVertexArray(0);
+    constexpr size_t quadStride = 5 * sizeof(float);
+    quadVBO_ = device_->createBuffer({
+        BufferType::Vertex, BufferAccess::Static,
+        sizeof(quadVerts), quadVerts
+    });
+
+    VertexInputDesc quadVI;
+    quadVI.bindings    = { { quadStride, 0 } };
+    quadVI.attributes  = {
+        { 0, 3, 0, 0 },
+        { 1, 2, 0, 3 * sizeof(float) }
+    };
+    quadVI.vertexBuffers = { quadVBO_.get() };
+    quadInput_ = device_->createVertexInput(quadVI);
 }
 
 void PBRRenderer::renderCubeGeometry()
 {
-    glBindVertexArray(cubeVAO_);
-    glDrawArrays(GL_TRIANGLES, 0, 36);
+    ctx_->bindVertexInput(cubeInput_.get());
+    ctx_->draw(PrimitiveType::Triangles, 36);
 }
 
 void PBRRenderer::renderSphereGeometry(int lod)
 {
-    auto& m = sphereLODs_[lod];
-    glBindVertexArray(m.vao);
-    glDrawElements(GL_TRIANGLE_STRIP, m.indexCount, GL_UNSIGNED_INT, 0);
+    ctx_->bindVertexInput(sphereLODs_[lod].vertexInput.get());
+    ctx_->drawIndexed(PrimitiveType::TriangleStrip, sphereLODs_[lod].indexCount);
 }
 
 void PBRRenderer::renderQuadGeometry()
 {
-    glBindVertexArray(quadVAO_);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    ctx_->bindVertexInput(quadInput_.get());
+    ctx_->draw(PrimitiveType::TriangleStrip, 4);
 }
 
 // ============================================================
-//  Sphere mesh creation & instancing setup
+//  Sphere mesh creation
 // ============================================================
 
 void PBRRenderer::createSphereMesh(SphereMesh& mesh, int segments)
@@ -647,105 +663,114 @@ void PBRRenderer::createSphereMesh(SphereMesh& mesh, int segments)
         }
         oddRow = !oddRow;
     }
-    mesh.indexCount = static_cast<unsigned int>(indices.size());
+    mesh.indexCount = static_cast<int>(indices.size());
 
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+    constexpr size_t vertStride = 8 * sizeof(float);
 
-    constexpr GLsizei stride = 8 * sizeof(float);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)(6 * sizeof(float)));
-    glBindVertexArray(0);
-}
+    mesh.vertexBuffer = device_->createBuffer({
+        BufferType::Vertex, BufferAccess::Static,
+        data.size() * sizeof(float), data.data()
+    });
 
-void PBRRenderer::setupMeshInstanceAttribs(SphereMesh& mesh)
-{
-    glGenBuffers(1, &mesh.instanceVBO);
+    mesh.indexBuffer = device_->createBuffer({
+        BufferType::Index, BufferAccess::Static,
+        indices.size() * sizeof(unsigned int), indices.data()
+    });
 
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.instanceVBO);
+    mesh.instanceBuffer = device_->createBuffer({
+        BufferType::Instance, BufferAccess::Stream,
+        sizeof(InstanceData), nullptr
+    });
 
-    for (int i = 0; i < 4; ++i) {
-        glEnableVertexAttribArray(3 + i);
-        glVertexAttribPointer(3 + i, 4, GL_FLOAT, GL_FALSE,
-                              sizeof(InstanceData),
-                              (void*)(offsetof(InstanceData, model) + sizeof(glm::vec4) * i));
-        glVertexAttribDivisor(3 + i, 1);
-    }
+    VertexInputDesc vi;
+    vi.bindings = {
+        { vertStride, 0 },       // binding 0: per-vertex
+        { sizeof(InstanceData), 1 } // binding 1: per-instance
+    };
+    vi.attributes = {
+        // Per-vertex attributes
+        { 0, 3, 0, 0 },
+        { 1, 3, 0, 3 * sizeof(float) },
+        { 2, 2, 0, 6 * sizeof(float) },
+        // Per-instance: model matrix (4 vec4 columns)
+        { 3, 4, 1, offsetof(InstanceData, model) + 0 * sizeof(glm::vec4) },
+        { 4, 4, 1, offsetof(InstanceData, model) + 1 * sizeof(glm::vec4) },
+        { 5, 4, 1, offsetof(InstanceData, model) + 2 * sizeof(glm::vec4) },
+        { 6, 4, 1, offsetof(InstanceData, model) + 3 * sizeof(glm::vec4) },
+        // Per-instance: material vec4
+        { 7, 4, 1, offsetof(InstanceData, material) }
+    };
+    vi.vertexBuffers = { mesh.vertexBuffer.get(), mesh.instanceBuffer.get() };
+    vi.indexBuffer   = mesh.indexBuffer.get();
 
-    glEnableVertexAttribArray(7);
-    glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE,
-                          sizeof(InstanceData),
-                          (void*)offsetof(InstanceData, material));
-    glVertexAttribDivisor(7, 1);
-
-    glBindVertexArray(0);
+    mesh.vertexInput = device_->createVertexInput(vi);
 }
 
 // ============================================================
 //  Texture loading
 // ============================================================
 
-unsigned int PBRRenderer::loadTexture(const char* path)
+RHITexture* PBRRenderer::loadTexture(const char* path)
 {
-    unsigned int textureID;
-    glGenTextures(1, &textureID);
-
     int width, height, nrComponents;
     unsigned char* data = stbi_load(path, &width, &height, &nrComponents, 0);
-    if (data) {
-        GLenum format = GL_RGB;
-        if      (nrComponents == 1) format = GL_RED;
-        else if (nrComponents == 3) format = GL_RGB;
-        else if (nrComponents == 4) format = GL_RGBA;
-
-        glBindTexture(GL_TEXTURE_2D, textureID);
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        stbi_image_free(data);
-    } else {
+    if (!data) {
         std::cerr << "[PBRRenderer] Texture load failed: " << path << std::endl;
         stbi_image_free(data);
-        glDeleteTextures(1, &textureID);
-        return 0;
+        return nullptr;
     }
 
-    return textureID;
+    TextureFormat fmt = TextureFormat::RGB8;
+    if      (nrComponents == 1) fmt = TextureFormat::R8;
+    else if (nrComponents == 3) fmt = TextureFormat::RGB8;
+    else if (nrComponents == 4) fmt = TextureFormat::RGBA8;
+
+    TextureDesc desc;
+    desc.type      = TextureType::Texture2D;
+    desc.format    = fmt;
+    desc.width     = width;
+    desc.height    = height;
+    desc.mipmaps   = true;
+    desc.minFilter = FilterMode::LinearMipLinear;
+    desc.magFilter = FilterMode::Linear;
+    desc.wrapS     = WrapMode::Repeat;
+    desc.wrapT     = WrapMode::Repeat;
+
+    auto tex = device_->createTexture(desc);
+    tex->upload(data, 0, -1);
+    tex->generateMipmaps();
+
+    stbi_image_free(data);
+
+    loadedTextures_.push_back(std::move(tex));
+    return loadedTextures_.back().get();
 }
 
-unsigned int PBRRenderer::loadHDRTexture(const char* path)
+RHITexture* PBRRenderer::loadHDRTexture(const char* path)
 {
     stbi_set_flip_vertically_on_load(true);
     int width, height, nrComponents;
     float* data = stbi_loadf(path, &width, &height, &nrComponents, 0);
     if (!data) {
         std::cerr << "[PBRRenderer] HDR load failed: " << path << std::endl;
-        return 0;
+        return nullptr;
     }
 
-    unsigned int hdrTexture;
-    glGenTextures(1, &hdrTexture);
-    glBindTexture(GL_TEXTURE_2D, hdrTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, data);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    TextureDesc desc;
+    desc.type      = TextureType::Texture2D;
+    desc.format    = TextureFormat::RGB16F;
+    desc.width     = width;
+    desc.height    = height;
+    desc.wrapS     = WrapMode::ClampToEdge;
+    desc.wrapT     = WrapMode::ClampToEdge;
+    desc.minFilter = FilterMode::Linear;
+    desc.magFilter = FilterMode::Linear;
+
+    auto tex = device_->createTexture(desc);
+    tex->upload(data, 0, -1);
 
     stbi_image_free(data);
-    return hdrTexture;
+
+    loadedTextures_.push_back(std::move(tex));
+    return loadedTextures_.back().get();
 }

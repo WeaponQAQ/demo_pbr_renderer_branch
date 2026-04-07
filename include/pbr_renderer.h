@@ -1,10 +1,11 @@
 #pragma once
 
-#include <glad/glad.h>
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
-#include "shader.h"
+#include <memory>
+
+#include "rhi/rhi.h"
 #include "camera.h"
 
 struct PBRMaterial {
@@ -14,11 +15,11 @@ struct PBRMaterial {
     float ao            = 1.0f;
     bool useTextures    = false;
 
-    unsigned int albedoMap    = 0;
-    unsigned int normalMap    = 0;
-    unsigned int metallicMap  = 0;
-    unsigned int roughnessMap = 0;
-    unsigned int aoMap        = 0;
+    RHITexture* albedoMap    = nullptr;
+    RHITexture* normalMap    = nullptr;
+    RHITexture* metallicMap  = nullptr;
+    RHITexture* roughnessMap = nullptr;
+    RHITexture* aoMap        = nullptr;
 };
 
 struct PointLight {
@@ -35,7 +36,7 @@ public:
     PBRRenderer(const PBRRenderer&)            = delete;
     PBRRenderer& operator=(const PBRRenderer&) = delete;
 
-    bool init(const std::string& shaderDir);
+    bool init(RHIDevice* device, const std::string& shaderDir);
     void resize(int width, int height);
 
     void setupIBL(const std::string& hdrPath);
@@ -50,8 +51,8 @@ public:
                             const glm::mat4& modelMatrix);
     void renderBackground(const Camera& camera);
 
-    unsigned int loadTexture(const char* path);
-    unsigned int loadHDRTexture(const char* path);
+    RHITexture* loadTexture(const char* path);
+    RHITexture* loadHDRTexture(const char* path);
 
     void setClipPlanes(float nearPlane, float farPlane)
         { nearPlane_ = nearPlane; farPlane_ = farPlane; }
@@ -81,44 +82,48 @@ private:
     void renderSphereGeometry(int lod = 0);
     void renderQuadGeometry();
 
-    void generateIBLMaps(unsigned int hdrTexture);
+    void generateIBLMaps(RHITexture* hdrTexture);
 
     struct SphereMesh {
-        unsigned int vao = 0, vbo = 0, ebo = 0;
-        unsigned int indexCount = 0;
-        unsigned int instanceVBO = 0;
+        std::unique_ptr<RHIBuffer>      vertexBuffer;
+        std::unique_ptr<RHIBuffer>      indexBuffer;
+        std::unique_ptr<RHIBuffer>      instanceBuffer;
+        std::unique_ptr<RHIVertexInput> vertexInput;
+        int indexCount = 0;
     };
     void createSphereMesh(SphereMesh& mesh, int segments);
-    void setupMeshInstanceAttribs(SphereMesh& mesh);
 
-    Shader pbrShader_;
-    Shader equirectToCubemapShader_;
-    Shader irradianceShader_;
-    Shader prefilterShader_;
-    Shader brdfShader_;
-    Shader backgroundShader_;
+    RHIDevice*  device_ = nullptr;
+    RHIContext* ctx_    = nullptr;
 
-    unsigned int envCubemap_     = 0;
-    unsigned int irradianceMap_  = 0;
-    unsigned int prefilterMap_   = 0;
-    unsigned int brdfLUTTexture_ = 0;
+    std::unique_ptr<RHIShader> pbrShader_;
+    std::unique_ptr<RHIShader> equirectToCubemapShader_;
+    std::unique_ptr<RHIShader> irradianceShader_;
+    std::unique_ptr<RHIShader> prefilterShader_;
+    std::unique_ptr<RHIShader> brdfShader_;
+    std::unique_ptr<RHIShader> backgroundShader_;
 
-    unsigned int cubeVAO_ = 0, cubeVBO_ = 0;
+    std::unique_ptr<RHITexture> envCubemap_;
+    std::unique_ptr<RHITexture> irradianceMap_;
+    std::unique_ptr<RHITexture> prefilterMap_;
+    std::unique_ptr<RHITexture> brdfLUTTexture_;
+
+    std::unique_ptr<RHIBuffer>      cubeVBO_;
+    std::unique_ptr<RHIVertexInput> cubeInput_;
 
     static constexpr int NUM_LODS = 3;
     SphereMesh sphereLODs_[NUM_LODS];
 
-    unsigned int quadVAO_ = 0, quadVBO_ = 0;
+    std::unique_ptr<RHIBuffer>      quadVBO_;
+    std::unique_ptr<RHIVertexInput> quadInput_;
 
     int visibleCount_ = 0, culledCount_ = 0;
     int lodCounts_[NUM_LODS] = {};
 
-    unsigned int gpuTimerQueries_[2] = {};
-    int gpuQueryIdx_ = 0;
+    std::unique_ptr<RHITimerQuery> timerQuery_;
     float gpuTimeMs_ = 0.0f;
-    bool gpuTimerReady_ = false;
 
-    unsigned int captureFBO_ = 0, captureRBO_ = 0;
+    std::unique_ptr<RHIFramebuffer> captureFBO_;
 
     int screenWidth_  = 1280;
     int screenHeight_ = 720;
@@ -126,4 +131,6 @@ private:
     float farPlane_   = 500.0f;
     bool iblInitialized_ = false;
     std::string currentHDRPath_;
+
+    std::vector<std::unique_ptr<RHITexture>> loadedTextures_;
 };

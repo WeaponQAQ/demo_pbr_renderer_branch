@@ -46,8 +46,15 @@ file(GLOB_RECURSE SOURCES src/*.cpp src/*.c)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
+target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
+
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/rhi
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE

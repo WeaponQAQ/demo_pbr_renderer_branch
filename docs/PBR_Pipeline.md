@@ -20,10 +20,38 @@
 10. [着色器文件对照表](#10-着色器文件对照表)
 11. [场景配置与动态 HDR 加载](#11-场景配置与动态-hdr-加载)
 12. [渲染性能优化](#12-渲染性能优化)
+13. [RHI 渲染硬件接口](#13-rhi-渲染硬件接口)
 
 ---
 
 ## 1. 总体架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Application Layer                     │
+│                                                         │
+│    main.cpp ──────► PBRRenderer                         │
+│      │                 │                                │
+│      │  createOpenGL   │  device_->create*()            │
+│      │  Device()       │  ctx_->bindShader()            │
+│      ▼                 │  ctx_->drawIndexed*()          │
+│                        ▼                                │
+├─────────────────────────────────────────────────────────┤
+│              RHI Interface Layer (纯虚接口)               │
+│                                                         │
+│   RHIDevice   RHIContext   RHICommandList               │
+│   RHIBuffer   RHITexture   RHIShader                    │
+│   RHIFramebuffer   RHIVertexInput   RHITimerQuery       │
+├─────────────────────────────────────────────────────────┤
+│            OpenGL 3.3 Backend (具体实现)                  │
+│                                                         │
+│   GLDevice   GLContext   GLCommandList                  │
+│   GLBuffer   GLTexture   GLShader                       │
+│   GLFramebuffer   GLVertexInput   GLTimerQuery          │
+│                                                         │
+│   内部调用: glGen* / glBind* / glDraw* / glUniform*      │
+└─────────────────────────────────────────────────────────┘
+```
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -551,29 +579,37 @@ SceneConfig::loadFromFile("scene.json")
 ### 9.1 初始化阶段
 
 ```
-PBRRenderer::init(shaderDir)
-    ├── 编译加载 6 个着色器程序
-    │   ├── pbr.vert/frag          → pbrShader_
+main():
+    ├── GLFW/GLAD 初始化 → 创建窗口和 OpenGL 上下文
+    ├── createOpenGLDevice()    → 创建 RHIDevice (多后端入口)
+    └── ctx->setDepthTest() / setSeamlessCubemap() / setMultisample()
+
+PBRRenderer::init(device, shaderDir)
+    ├── 保存 device_ 和 ctx_ 指针
+    │
+    ├── 读取 GLSL 源码 → device_->createShader() 编译 6 个着色器
+    │   ├── pbr.vert/frag          → pbrShader_        (unique_ptr<RHIShader>)
     │   ├── equirect_to_cubemap    → equirectToCubemapShader_
     │   ├── irradiance             → irradianceShader_
     │   ├── prefilter              → prefilterShader_
     │   ├── brdf                   → brdfShader_
     │   └── background             → backgroundShader_
     │
-    ├── 绑定纹理单元
+    ├── ctx_->bindShader() + setInt() → 绑定纹理单元
     │   ├── unit 0: irradianceMap
     │   ├── unit 1: prefilterMap
     │   ├── unit 2: brdfLUT
     │   └── unit 3-7: 材质贴图 (albedo, normal, metallic, roughness, ao)
     │
-    ├── setupGeometry() → 统一创建几何体
-    │   ├── Cube      → 用于 Cubemap 渲染和天空盒
-    │   ├── Sphere LOD 0 → 64×64 细分 (4225 顶点, 近距离)
-    │   ├── Sphere LOD 1 → 32×32 细分 (1089 顶点, 中距离)
-    │   ├── Sphere LOD 2 → 16×16 细分 (289 顶点, 远距离)
-    │   └── Quad      → 用于 BRDF LUT 全屏渲染
+    ├── setupGeometry() → 通过 device_->createBuffer/createVertexInput 创建几何体
+    │   ├── Cube      → cubeVBO_ + cubeInput_ (RHIVertexInput)
+    │   ├── Sphere LOD 0 → 64×64 细分 (vertexBuffer + indexBuffer + instanceBuffer + vertexInput)
+    │   ├── Sphere LOD 1 → 32×32 细分
+    │   ├── Sphere LOD 2 → 16×16 细分
+    │   └── Quad      → quadVBO_ + quadInput_
     │
-    └── 创建 captureFBO_/captureRBO_ → 用于离屏渲染
+    ├── device_->createTimerQuery()     → timerQuery_
+    └── device_->createFramebuffer()    → captureFBO_ (用于离屏 IBL 渲染)
 
 SceneConfig::scanHDRFiles(directory)
     └── 扫描目录下所有 .hdr/.exr 文件 → 填充 ImGui 下拉列表
@@ -583,28 +619,33 @@ SceneConfig::scanHDRFiles(directory)
 
 ```
 PBRRenderer::setupIBL(hdrPath)            ← hdrPath 从 scene.json 读取
-    ├── loadHDRTexture()                  → 加载 .hdr 文件为 GL_RGB16F 纹理
+    ├── loadHDRTexture()                  → device_->createTexture() + upload()
     │
-    └── generateIBLMaps()
+    └── generateIBLMaps()                 ← 全部通过 RHI 接口操作
         │
         ├── [Pass 1] Equirect → Cubemap (512×512 × 6 faces)
-        │   ├── 绑定 HDR 纹理
-        │   ├── renderCubemapFaces() × 6 次 FBO 渲染
-        │   └── 生成 Mipmap
+        │   ├── device_->createTexture(CubeMap, RGB16F)
+        │   ├── ctx_->beginPass(captureFBO_)
+        │   ├── ctx_->attachCubeFace() × 6 面 + renderCubeGeometry()
+        │   ├── ctx_->endPass()
+        │   └── envCubemap_->generateMipmaps()
         │
         ├── [Pass 2] Irradiance Convolution (32×32 × 6 faces)
-        │   ├── 绑定 envCubemap_
-        │   └── renderCubemapFaces() × 6 次 FBO 渲染
+        │   ├── device_->createTexture(CubeMap, RGB16F)
+        │   ├── ctx_->bindTexture(0, envCubemap_)
+        │   └── ctx_->beginPass() → attachCubeFace() × 6 → endPass()
         │
         ├── [Pass 3] Pre-filter (128→64→32→16→8, 5 mip × 6 faces)
-        │   ├── 绑定 envCubemap_
-        │   └── renderCubemapFaces() × 5 mip × 6 面 = 30 次 FBO 渲染
+        │   ├── device_->createTexture(CubeMap, RGB16F, mipmaps=true)
+        │   ├── ctx_->bindTexture(0, envCubemap_)
+        │   └── 5 mip × 6 面 = 30 次 attachCubeFace() + draw
         │
         └── [Pass 4] BRDF LUT (512×512, 一次全屏 quad 渲染)
-            └── 纯数学计算，不依赖环境贴图
+            ├── device_->createTexture(Texture2D, RG16F)
+            └── ctx_->attachTexture2D() + renderQuadGeometry()
 
 PBRRenderer::reloadIBL(newHdrPath)        ← 运行时切换 HDR
-    ├── releaseIBL()                      → 释放旧 IBL 纹理
+    ├── releaseIBL()                      → unique_ptr::reset() 自动释放
     └── setupIBL(newHdrPath)              → 重新生成
 ```
 
@@ -619,24 +660,30 @@ PBRRenderer::reloadIBL(newHdrPath)        ← 运行时切换 HDR
     │
     ├── 更新灯光颜色 (lightColor × lightIntensity)
     │
-    ├── 清屏
+    ├── ctx->setViewport() + ctx->clear()           ← 通过 RHI 清屏
     │
     ├── renderScene()
-    │   ├── GPU Timer Query → 读取上帧结果 + 启动本帧查询
-    │   ├── setupCameraUniforms()   → projection, view, camPos
-    │   ├── setupMaterialUniforms() → useTextures, albedo, metallic, roughness, ao
-    │   ├── bindIBLTextures()       → irradiance, prefilter, brdfLUT
-    │   ├── setupLightUniforms()    → lightPositions[], lightColors[], numLights
-    │   ├── extractFrustum(VP)      → 提取 6 个裁剪平面
+    │   ├── ctx_->getTimerResultMs()        → 读取上帧 GPU 耗时（无阻塞）
+    │   ├── ctx_->bindShader(pbrShader_)
+    │   ├── setupCameraUniforms()           → shader->setMat4/setVec3
+    │   ├── setupMaterialUniforms()         → ctx_->bindTexture(slot, tex)
+    │   ├── bindIBLTextures()               → ctx_->bindTexture(0/1/2, ...)
+    │   ├── setupLightUniforms()            → shader->setVec3/setInt
+    │   ├── ctx_->beginTimerQuery()
+    │   ├── extractFrustum(VP)              → 提取 6 个裁剪平面
     │   └── 对每个球体:
     │       ├── 视锥体剔除 → 不可见则跳过
     │       ├── LOD 选择   → 按距离分桶 (LOD 0/1/2)
-    │       └── 按 LOD 分组 instanced draw / 逐球 draw
+    │       ├── instanceBuffer->update()    → 上传实例数据
+    │       ├── ctx_->bindVertexInput()
+    │       └── ctx_->drawIndexedInstanced()
+    │   ctx_->endTimerQuery()
     │
     ├── renderBackground()
-    │   ├── 绑定 envCubemap_
-    │   ├── 使用 view 矩阵的旋转部分（去除平移 → 天空盒）
-    │   └── 深度设为 w (gl_Position.xyww) → 始终最远
+    │   ├── ctx_->bindShader(backgroundShader_)
+    │   ├── ctx_->bindTexture(0, envCubemap_)
+    │   ├── ctx_->bindVertexInput(cubeInput_)
+    │   └── ctx_->draw(Triangles, 36)
     │
     └── drawUI() → ImGui 渲染叠加层
         ├── Material 面板     → albedo, metallic, roughness, ao 滑块
@@ -711,6 +758,8 @@ reloadIBL(newPath)
 
 ### 11.3 代码架构
 
+**应用层**
+
 | 类/结构体 | 文件 | 职责 |
 |-----------|------|------|
 | `SceneConfig` | `scene_config.h/cpp` | JSON 解析、序列化、HDR 文件扫描 |
@@ -722,8 +771,37 @@ reloadIBL(newPath)
 | `GridConfig` | `scene_config.h` | 球体网格参数 |
 | `AppState` | `main.cpp` | 运行时全局状态，集中管理 |
 | `PerfStats` | `main.cpp` | 帧时间、GPU 时间、剔除/LOD 统计 |
-| `PBRRenderer` | `pbr_renderer.h/cpp` | 渲染核心，含 IBL 热重载、视锥剔除、LOD、GPU 计时 |
-| `SphereMesh` | `pbr_renderer.h` (内嵌) | 单个 LOD 级别的球体网格（VAO/VBO/EBO + Instance VBO） |
+| `PBRRenderer` | `pbr_renderer.h/cpp` | 渲染核心，通过 RHI 接口操作，零 `gl*` 调用 |
+| `PBRMaterial` | `pbr_renderer.h` | 材质参数 + `RHITexture*` 贴图指针 |
+| `SphereMesh` | `pbr_renderer.h` (内嵌) | 单个 LOD 级别（`RHIBuffer` + `RHIVertexInput` + indexCount） |
+
+**RHI 接口层** — 纯虚基类，与后端无关
+
+| 类 | 文件 | 职责 |
+|----|------|------|
+| `RHIDevice` | `rhi/rhi_device.h` | 资源工厂（createBuffer/Texture/Shader/CommandList/...） |
+| `RHIContext` | `rhi/rhi_context.h` | 命令提交（draw/bind/clear/submit/...） |
+| `RHICommandList` | `rhi/rhi_command_list.h` | 延迟命令录制接口（多线程安全，主线程回放） |
+| `RHIBuffer` | `rhi/rhi_resource.h` | GPU 缓冲区抽象（Vertex/Index/Instance） |
+| `RHITexture` | `rhi/rhi_resource.h` | 纹理抽象（2D/CubeMap，upload/generateMipmaps） |
+| `RHIShader` | `rhi/rhi_resource.h` | 着色器程序抽象（uniform 设置） |
+| `RHIFramebuffer` | `rhi/rhi_resource.h` | 离屏渲染目标抽象 |
+| `RHIVertexInput` | `rhi/rhi_resource.h` | 顶点输入布局抽象（VAO 概念） |
+| `RHITimerQuery` | `rhi/rhi_resource.h` | GPU 计时查询抽象 |
+
+**OpenGL 3.3 后端** — 具体实现
+
+| 类 | 文件 | 职责 |
+|----|------|------|
+| `GLDevice` | `rhi/opengl/gl_device.h/cpp` | 通过 `glGen*` 创建 GL 资源 |
+| `GLContext` | `rhi/opengl/gl_context.h/cpp` | 通过 `glBind*/glDraw*` 执行命令 + `submit()` 回放命令列表 |
+| `GLCommandList` | `rhi/opengl/gl_command_list.h/cpp` | `std::variant` 命令录制，无 GL 依赖，线程安全 |
+| `GLBuffer` | `rhi/opengl/gl_resources.h/cpp` | 封装 `glGenBuffers` / `glBufferData` |
+| `GLTexture` | `rhi/opengl/gl_resources.h/cpp` | 封装 `glGenTextures` / `glTexImage2D` |
+| `GLShader` | `rhi/opengl/gl_resources.h/cpp` | 吸收原 `Shader` 类，封装 `glCreateProgram` |
+| `GLFramebuffer` | `rhi/opengl/gl_resources.h/cpp` | 封装 FBO + RBO |
+| `GLVertexInput` | `rhi/opengl/gl_resources.h/cpp` | 封装 VAO + 顶点属性配置 |
+| `GLTimerQuery` | `rhi/opengl/gl_resources.h/cpp` | 封装 `GL_TIME_ELAPSED` 双缓冲查询 |
 
 ---
 
@@ -824,7 +902,7 @@ bool sphereInFrustum(const Frustum& f, const glm::vec3& center, float radius) {
 
 **与 Instancing 结合**：
 
-将通过视锥剔除的球体按 LOD 级别分桶，每个 LOD 级别拥有独立的 VAO 和 Instance VBO，进行一次 `glDrawElementsInstanced` 调用。最多 3 次 Draw Call 即可渲染整个场景。
+将通过视锥剔除的球体按 LOD 级别分桶，每个 LOD 级别拥有独立的 `RHIVertexInput` 和 Instance `RHIBuffer`，通过 `ctx_->drawIndexedInstanced()` 调用。最多 3 次 Draw Call 即可渲染整个场景。
 
 ```
 渲染流程:
@@ -834,47 +912,41 @@ bool sphereInFrustum(const Frustum& f, const glm::vec3& center, float radius) {
     │   └── 写入对应 LOD 桶的 InstanceData
     │
     └── 对每个非空 LOD 桶:
-        ├── 上传 Instance Buffer (GL_STREAM_DRAW)
-        ├── 绑定该 LOD 的 VAO
-        └── glDrawElementsInstanced()
+        ├── instanceBuffer->update()             → 上传实例数据
+        ├── ctx_->bindVertexInput(vertexInput)   → 绑定该 LOD 的顶点输入
+        └── ctx_->drawIndexedInstanced()         → 一次绘制所有实例
 ```
 
 **网格创建** (`pbr_renderer.cpp`)：
 
-每个 LOD 级别在初始化时调用 `createSphereMesh()` 生成不同分辨率的 UV 球体，并通过 `setupMeshInstanceAttribs()` 配置 Instance 属性（model 矩阵 → location 3-6，材质参数 → location 7）。
+每个 LOD 级别在初始化时调用 `createSphereMesh()` 生成不同分辨率的 UV 球体。该函数通过 `device_->createBuffer()` 创建顶点/索引/实例缓冲区，再通过 `device_->createVertexInput()` 配置顶点输入布局（per-vertex: location 0-2，per-instance: model 矩阵 → location 3-6，材质参数 → location 7）。
 
 ### 12.4 GPU Timer Query
 
-CPU 端的帧时间（`glfwGetTime()` 差值）包含了 CPU 逻辑、驱动开销、VSync 等待等成分，无法准确反映 GPU 实际渲染耗时。通过 OpenGL 的 `GL_TIME_ELAPSED` 查询可精确测量 GPU 执行命令所花费的纳秒数。
+CPU 端的帧时间（`glfwGetTime()` 差值）包含了 CPU 逻辑、驱动开销、VSync 等待等成分，无法准确反映 GPU 实际渲染耗时。通过 RHI 的 `RHITimerQuery` 可精确测量 GPU 执行命令所花费的纳秒数（OpenGL 后端内部使用 `GL_TIME_ELAPSED` 查询）。
 
 **双缓冲策略**：
 
-为避免 `glGetQueryObjectui64v` 阻塞 CPU 等待 GPU 完成，使用两个 Query 对象交替工作——当前帧启动查询 A，读取上一帧查询 B 的结果（此时 B 已确保完成）。
+为避免查询结果读取阻塞 CPU 等待 GPU 完成，`GLTimerQuery` 内部维护两个 Query 对象交替工作——当前帧启动查询 A，读取上一帧查询 B 的结果（此时 B 已确保完成）。
 
 ```
-帧 N:   glBeginQuery(query[0])  ...渲染...  glEndQuery(query[0])
-帧 N+1: glBeginQuery(query[1])  ...渲染...  glEndQuery(query[1])
-        glGetQueryResult(query[0]) → 读取帧 N 的 GPU 耗时（无阻塞）
-帧 N+2: glBeginQuery(query[0])  ...渲染...  glEndQuery(query[0])
-        glGetQueryResult(query[1]) → 读取帧 N+1 的 GPU 耗时（无阻塞）
+帧 N:   beginTimerQuery(q)  ...渲染...  endTimerQuery(q)
+帧 N+1: getTimerResultMs(q) → 读取帧 N 的 GPU 耗时（无阻塞）
+        beginTimerQuery(q)  ...渲染...  endTimerQuery(q)
+帧 N+2: getTimerResultMs(q) → 读取帧 N+1 的 GPU 耗时（无阻塞）
+        beginTimerQuery(q)  ...渲染...  endTimerQuery(q)
 ```
 
 **实现** (`pbr_renderer.cpp`)：
 
 ```cpp
-// 读取上一帧的查询结果（延迟一帧，无阻塞）
-if (gpuTimerReady_) {
-    GLuint64 elapsed = 0;
-    glGetQueryObjectui64v(gpuTimerQueries_[1 - gpuQueryIdx_],
-                          GL_QUERY_RESULT, &elapsed);
-    gpuTimeMs_ = static_cast<float>(elapsed) / 1e6f;
-}
+// 读取上一帧的查询结果（延迟一帧，无阻塞，内部自动交换双缓冲索引）
+gpuTimeMs_ = ctx_->getTimerResultMs(timerQuery_.get());
 
 // 启动本帧查询
-glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries_[gpuQueryIdx_]);
+ctx_->beginTimerQuery(timerQuery_.get());
 // ... 渲染 ...
-glEndQuery(GL_TIME_ELAPSED);
-gpuQueryIdx_ = 1 - gpuQueryIdx_;
+ctx_->endTimerQuery(timerQuery_.get());
 ```
 
 ### 12.5 Performance 面板
@@ -905,6 +977,210 @@ ImGui 的 Performance 面板展示以下实时指标：
 | Instancing + 视锥剔除 + LOD | ~800* | ~0.5M* | ≤3 | GPU 工作量降低 **~95%** |
 
 *实际数值取决于相机位置和朝向
+
+---
+
+## 13. RHI 渲染硬件接口
+
+### 13.1 设计动机
+
+在引入 RHI 之前，`PBRRenderer` 直接调用 `gl*` 函数（如 `glGenBuffers`、`glBindTexture`、`glDrawElementsInstanced`），与 OpenGL API 强耦合。这带来两个问题：
+
+1. **不可移植**：若未来需要支持 Vulkan 或 D3D12，必须重写整个渲染器
+2. **职责混乱**：GPU 资源管理、渲染状态设置、绘制命令提交散布在渲染逻辑中
+
+RHI (Rendering Hardware Interface) 通过纯虚接口将图形 API 抽象为统一操作，使渲染器仅依赖抽象接口，后端实现可独立替换。
+
+### 13.2 架构分层
+
+```
+include/rhi/
+├── rhi_types.h          # 枚举（BufferType, TextureFormat, PrimitiveType...）
+│                        # 描述符结构体（BufferDesc, TextureDesc, ShaderDesc...）
+├── rhi_resource.h       # 资源纯虚基类（RHIBuffer, RHITexture, RHIShader...）
+├── rhi_command_list.h   # 命令列表纯虚接口（多线程录制）
+├── rhi_device.h         # 资源工厂接口 + createOpenGLDevice() 入口
+├── rhi_context.h        # 命令提交接口（draw, bind, clear, pass, submit...）
+└── rhi.h                # umbrella include
+
+include/rhi/opengl/
+├── gl_device.h          # GLDevice：实现 RHIDevice
+├── gl_context.h         # GLContext：实现 RHIContext（含 submit 回放）
+├── gl_command_list.h    # GLCommandList：variant 命令录制
+└── gl_resources.h       # GLBuffer/GLTexture/GLShader/GLFramebuffer/
+                         # GLVertexInput/GLTimerQuery 实现 + 格式映射函数
+
+src/rhi/opengl/
+├── gl_device.cpp
+├── gl_context.cpp
+├── gl_command_list.cpp
+└── gl_resources.cpp
+```
+
+### 13.3 类型系统
+
+所有枚举和描述符结构体定义在 `rhi_types.h` 中，与后端无关：
+
+| 枚举 | 值 | 用途 |
+|------|----|------|
+| `BufferType` | Vertex, Index, Instance | 缓冲区用途 |
+| `BufferAccess` | Static, Dynamic, Stream | 数据更新频率 |
+| `TextureType` | Texture2D, TextureCubeMap | 纹理类型 |
+| `TextureFormat` | R8, RGB8, RGBA8, RG16F, RGB16F | 像素格式 |
+| `PrimitiveType` | Triangles, TriangleStrip | 图元类型 |
+| `CompareFunc` | Less, LessEqual, Always | 深度比较函数 |
+| `WrapMode` | Repeat, ClampToEdge | 纹理环绕模式 |
+| `FilterMode` | Nearest, Linear, LinearMipLinear | 纹理过滤模式 |
+
+描述符结构体采用 POD 风格，创建资源时传入：
+
+```cpp
+TextureDesc desc;
+desc.type      = TextureType::TextureCubeMap;
+desc.format    = TextureFormat::RGB16F;
+desc.width     = 512;
+desc.height    = 512;
+desc.minFilter = FilterMode::LinearMipLinear;
+auto tex = device->createTexture(desc);
+```
+
+### 13.4 资源生命周期
+
+所有 GPU 资源通过 `RHIDevice` 工厂方法创建，返回 `std::unique_ptr`，由应用层持有。RAII 保证资源在 unique_ptr 析构时自动释放（OpenGL 后端调用对应的 `glDelete*`）。
+
+```
+创建:  auto buf = device->createBuffer(desc);    → GLBuffer 构造时调用 glGenBuffers + glBufferData
+使用:  buf->update(data, size);                   → glBufferData 重新分配
+销毁:  buf.reset();                               → ~GLBuffer() 调用 glDeleteBuffers
+```
+
+`PBRRenderer` 的成员变量从原来的 `unsigned int` GL 句柄全部替换为 `std::unique_ptr<RHI*>` 智能指针：
+
+| 原成员 | 新成员 | 类型 |
+|--------|--------|------|
+| `unsigned int cubeVAO_` | `cubeInput_` | `unique_ptr<RHIVertexInput>` |
+| `unsigned int cubeVBO_` | `cubeVBO_` | `unique_ptr<RHIBuffer>` |
+| `unsigned int envCubemap_` | `envCubemap_` | `unique_ptr<RHITexture>` |
+| `Shader pbrShader_` | `pbrShader_` | `unique_ptr<RHIShader>` |
+| `unsigned int captureFBO_` | `captureFBO_` | `unique_ptr<RHIFramebuffer>` |
+| `unsigned int gpuTimerQueries_[2]` | `timerQuery_` | `unique_ptr<RHITimerQuery>` |
+
+### 13.5 命令提交模型
+
+RHI 支持两种命令提交方式：
+
+**1. Immediate Mode — `RHIContext` 直接调用**
+
+每个方法调用立即执行对应的 GPU 命令，适用于单线程场景：
+
+```cpp
+ctx->bindShader(shader);
+ctx->bindVertexInput(vi);
+ctx->drawIndexedInstanced(PrimitiveType::TriangleStrip, indexCount, instances);
+```
+
+**2. Deferred Mode — `RHICommandList` 多线程录制 + 主线程提交**
+
+`RHICommandList` 将命令录制与执行分离。录制阶段不调用任何图形 API，可安全地在任意工作线程上进行；提交阶段在持有 GL 上下文的主线程上回放所有录制的命令。
+
+```
+┌──────────────────────────────┐
+│        Worker Thread(s)      │    ← 无 GL 上下文
+│                              │
+│  cmdList->bindShader(s)      │    录制为 cmd::BindShader{s}
+│  cmdList->bindTexture(0, t)  │    录制为 cmd::BindTexture{0, t}
+│  cmdList->drawIndexed(...)   │    录制为 cmd::DrawIndexed{...}
+│  cmdList->setShaderMat4(...) │    录制为 cmd::SetShaderMat4{...}
+│  cmdList->updateBuffer(...)  │    深拷贝数据到 vector<char>
+└──────────────┬───────────────┘
+               │ 传递 cmdList
+               ▼
+┌──────────────────────────────┐
+│       Render Thread          │    ← 持有 GL 上下文
+│                              │
+│  ctx->submit(cmdList)        │    遍历 variant 列表，
+│                              │    逐条调用 GLContext 的对应方法
+│  cmdList->reset()            │    清空命令列表以复用
+└──────────────────────────────┘
+```
+
+使用示例：
+
+```cpp
+auto cmdList = device->createCommandList();
+
+// 工作线程可安全录制（不触发 gl* 调用）
+cmdList->bindShader(pbrShader.get());
+cmdList->setShaderMat4(pbrShader.get(), "projection", projMatrix);
+cmdList->bindVertexInput(sphereInput.get());
+cmdList->drawIndexedInstanced(PrimitiveType::TriangleStrip, indexCount, 100);
+
+// 主线程提交（在 GL 上下文中回放）
+ctx->submit(cmdList.get());
+cmdList->reset();
+```
+
+**OpenGL 后端实现**：`GLCommandList` 使用 `std::variant` 存储命令，每条命令是一个轻量 POD 结构体（如 `cmd::BindShader{shader}`、`cmd::Draw{pt, count, first}`）。`GLContext::submit()` 通过 `std::visit` 遍历命令列表，对每个 variant 调用对应的 GL 方法。
+
+`RHICommandList` 在 `RHIContext` 基础上额外提供：
+
+| 方法 | 说明 |
+|------|------|
+| `reset()` | 清空命令列表，复用同一对象避免重复分配 |
+| `setShaderInt/Float/Vec3/Mat3/Mat4` | 录制 uniform 设置（捕获 shader 指针 + 参数值） |
+| `updateBuffer(buf, data, size)` | 录制缓冲区更新，深拷贝数据确保线程安全 |
+| `resizeFramebufferDepth(fb, w, h)` | 录制 FBO 深度附件尺寸调整 |
+
+关键方法分组（`RHIContext` + `RHICommandList` 共有）：
+
+| 分组 | 方法 | 说明 |
+|------|------|------|
+| Pass 管理 | `beginPass(fb)` / `beginDefaultPass()` / `endPass()` | 绑定/解绑 FBO |
+| 状态 | `setViewport` / `clear` / `setDepthTest` / `setSeamlessCubemap` | 渲染状态设置 |
+| 绑定 | `bindShader` / `bindVertexInput` / `bindTexture(slot, tex)` | 资源绑定 |
+| 绘制 | `draw` / `drawIndexed` / `drawIndexedInstanced` | 提交绘制命令 |
+| FBO 附件 | `attachTexture2D` / `attachCubeFace` | IBL 预计算时动态切换渲染目标 |
+| 计时 | `beginTimerQuery` / `endTimerQuery` / `getTimerResultMs`(仅 Context) | GPU 性能测量 |
+| 提交 | `submit(cmdList)`（仅 Context） | 回放命令列表中的所有命令 |
+
+### 13.6 OpenGL 后端实现要点
+
+GL 后端通过 `static_cast` 将 `RHI*` 基类指针转换为 `GL*` 具体类型，获取内部 GL 句柄：
+
+```cpp
+void GLContext::bindTexture(int slot, RHITexture* tex) {
+    auto* glTex = static_cast<GLTexture*>(tex);
+    glActiveTexture(GL_TEXTURE0 + slot);
+    glBindTexture(glTex->glTarget(), glTex->glId());
+}
+```
+
+格式映射通过独立的转换函数集中管理：
+
+| 函数 | 输入 | 输出 |
+|------|------|------|
+| `toGLBufferTarget()` | `BufferType` | `GL_ARRAY_BUFFER` / `GL_ELEMENT_ARRAY_BUFFER` |
+| `toGLBufferUsage()` | `BufferAccess` | `GL_STATIC_DRAW` / `GL_STREAM_DRAW` |
+| `toGLFormats()` | `TextureFormat` | `internalFormat` + `pixelFormat` + `dataType` |
+| `toGLPrimitive()` | `PrimitiveType` | `GL_TRIANGLES` / `GL_TRIANGLE_STRIP` |
+
+`GLShader` 吸收了原独立的 `Shader` 类（`shader.h/cpp`），包含完整的着色器编译/链接逻辑和 uniform location 缓存。
+
+### 13.7 扩展性
+
+添加新的图形后端（如 Vulkan）只需：
+
+1. 实现 `VkDevice : RHIDevice`、`VkContext : RHIContext`、`VkCommandList : RHICommandList` 及所有资源类
+2. 创建 `createVulkanDevice()` 工厂函数
+3. `main.cpp` 中根据配置选择 `createOpenGLDevice()` 或 `createVulkanDevice()`
+
+`PBRRenderer` 和所有渲染逻辑无需任何修改。
+
+对于 Vulkan 后端，`RHICommandList` 可自然映射为 `VkCommandBuffer`：
+- `VkCommandList::beginPass()` → `vkCmdBeginRenderPass()`
+- `VkCommandList::drawIndexedInstanced()` → `vkCmdDrawIndexed()` with instanceCount
+- `VkContext::submit()` → `vkQueueSubmit()` 提交 command buffer
+- 多个 command list 可在不同线程录制后批量提交到同一个 queue
 
 ---
 
