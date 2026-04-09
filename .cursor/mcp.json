@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "mcp-feedback-enhanced": {
+      "type": "stdio",
+      "command": "c:\\Users\\Administrator\\.cursor\\extensions\\mcp-feedback.cursor-feedback-2-2.5.15\\dist\\bin\\mcp-server.exe",
+      "args": [],
+      "env": {
+        "MCP_FEEDBACK_WORKSPACE_ID": "95cbe8b8f62e",
+        "MCP_FEEDBACK_WORKSPACE_FOLDER": "e:\\OpenGL",
+        "MCP_FEEDBACK_WORKSPACE_NAME": "OpenGL",
+        "MCP_FEEDBACK_STATE_DB": "c:\\Users\\Administrator\\AppData\\Roaming\\Cursor\\User\\workspaceStorage\\16d82ed7f7b14bf35d94ecc86b36d406\\state.vscdb"
+      },
+      "timeout": 600,
+      "autoApprove": [
+        "interactive_feedback"
+      ]
+    }
+  }
+}

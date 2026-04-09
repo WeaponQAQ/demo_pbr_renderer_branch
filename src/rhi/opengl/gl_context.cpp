@@ -214,8 +214,10 @@ void GLContext::beginTimerQuery(RHITimerQuery* q)
 
 void GLContext::endTimerQuery(RHITimerQuery* q)
 {
-    (void)q;
+    auto* glQ = static_cast<GLTimerQuery*>(q);
     glEndQuery(GL_TIME_ELAPSED);
+    glQ->swap();
+    glQ->markReady();
 }
 
 float GLContext::getTimerResultMs(RHITimerQuery* q)
@@ -225,9 +227,5 @@ float GLContext::getTimerResultMs(RHITimerQuery* q)
 
     GLuint64 elapsed = 0;
     glGetQueryObjectui64v(glQ->previousQuery(), GL_QUERY_RESULT, &elapsed);
-    float ms = static_cast<float>(elapsed) / 1e6f;
-
-    glQ->swap();
-    glQ->markReady();
-    return ms;
+    return static_cast<float>(elapsed) / 1e6f;
 }

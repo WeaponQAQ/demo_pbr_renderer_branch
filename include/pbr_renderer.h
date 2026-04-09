@@ -51,6 +51,13 @@ public:
                             const glm::mat4& modelMatrix);
     void renderBackground(const Camera& camera);
 
+    void recordScene(RHICommandList* cmd, const Camera& camera, const PBRMaterial& material,
+                     const std::vector<PointLight>& lights,
+                     int gridRows, int gridCols, float gridSpacing,
+                     bool renderGrid, bool useInstancing = true);
+    void recordBackground(RHICommandList* cmd, const Camera& camera);
+    void updateTimerResult();
+
     RHITexture* loadTexture(const char* path);
     RHITexture* loadHDRTexture(const char* path);
 
@@ -124,6 +131,8 @@ private:
     float gpuTimeMs_ = 0.0f;
 
     std::unique_ptr<RHIFramebuffer> captureFBO_;
+    std::unique_ptr<RHICommandList> sceneCmdList_;
+    std::unique_ptr<RHICommandList> bgCmdList_;
 
     int screenWidth_  = 1280;
     int screenHeight_ = 720;

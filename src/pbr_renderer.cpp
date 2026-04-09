@@ -375,18 +375,67 @@ int selectLOD(float dist)
 //  Rendering
 // ============================================================
 
+void PBRRenderer::updateTimerResult()
+{
+    gpuTimeMs_ = ctx_->getTimerResultMs(timerQuery_.get());
+}
+
 void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                                const std::vector<PointLight>& lights,
                                int gridRows, int gridCols, float gridSpacing,
                                bool renderGrid, bool useInstancing)
 {
-    gpuTimeMs_ = ctx_->getTimerResultMs(timerQuery_.get());
+    updateTimerResult();
 
-    ctx_->bindShader(pbrShader_.get());
-    setupCameraUniforms(camera);
-    setupMaterialUniforms(material);
-    bindIBLTextures();
-    setupLightUniforms(lights);
+    if (!sceneCmdList_) sceneCmdList_ = device_->createCommandList();
+    sceneCmdList_->reset();
+    recordScene(sceneCmdList_.get(), camera, material, lights,
+                gridRows, gridCols, gridSpacing, renderGrid, useInstancing);
+    ctx_->submit(sceneCmdList_.get());
+}
+
+void PBRRenderer::recordScene(RHICommandList* cmd, const Camera& camera,
+                               const PBRMaterial& material,
+                               const std::vector<PointLight>& lights,
+                               int gridRows, int gridCols, float gridSpacing,
+                               bool renderGrid, bool useInstancing)
+{
+    RHIShader* pbr = pbrShader_.get();
+    cmd->bindShader(pbr);
+
+    glm::mat4 proj = projectionMatrix(camera);
+    glm::mat4 view = camera.GetViewMatrix();
+    cmd->setShaderMat4(pbr, "projection", glm::value_ptr(proj));
+    cmd->setShaderMat4(pbr, "view",       glm::value_ptr(view));
+    cmd->setShaderVec3(pbr, "camPos",     glm::value_ptr(camera.Position));
+
+    cmd->setShaderInt(pbr, "useTextures", material.useTextures ? 1 : 0);
+    if (material.useTextures) {
+        if (material.albedoMap)    cmd->bindTexture(3, material.albedoMap);
+        if (material.normalMap)    cmd->bindTexture(4, material.normalMap);
+        if (material.metallicMap)  cmd->bindTexture(5, material.metallicMap);
+        if (material.roughnessMap) cmd->bindTexture(6, material.roughnessMap);
+        if (material.aoMap)        cmd->bindTexture(7, material.aoMap);
+    } else {
+        cmd->setShaderVec3(pbr,  "albedoValue",    glm::value_ptr(material.albedo));
+        cmd->setShaderFloat(pbr, "metallicValue",  material.metallic);
+        cmd->setShaderFloat(pbr, "roughnessValue", material.roughness);
+        cmd->setShaderFloat(pbr, "aoValue",        material.ao);
+    }
+
+    cmd->bindTexture(0, irradianceMap_.get());
+    cmd->bindTexture(1, prefilterMap_.get());
+    cmd->bindTexture(2, brdfLUTTexture_.get());
+
+    int n = static_cast<int>(std::min(lights.size(), size_t(4)));
+    cmd->setShaderInt(pbr, "numLights", n);
+    for (int i = 0; i < n; ++i) {
+        std::string idx = std::to_string(i);
+        cmd->setShaderVec3(pbr, "lightPositions[" + idx + "]",
+                           glm::value_ptr(lights[i].position));
+        cmd->setShaderVec3(pbr, "lightColors[" + idx + "]",
+                           glm::value_ptr(lights[i].color));
+    }
 
     if (!renderGrid) {
         visibleCount_ = culledCount_ = 0;
@@ -394,9 +443,9 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
         return;
     }
 
-    ctx_->beginTimerQuery(timerQuery_.get());
+    cmd->beginTimerQuery(timerQuery_.get());
 
-    glm::mat4 vp = projectionMatrix(camera) * camera.GetViewMatrix();
+    glm::mat4 vp = proj * view;
     Frustum frustum = extractFrustum(vp);
 
     visibleCount_ = 0;
@@ -419,7 +468,8 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                 }
 
                 float roughness = glm::clamp(
-                    static_cast<float>(col) / static_cast<float>(std::max(gridCols - 1, 1)),
+                    static_cast<float>(col) /
+                    static_cast<float>(std::max(gridCols - 1, 1)),
                     0.05f, 1.0f);
 
                 int lod = selectLOD(glm::length(camera.Position - pos));
@@ -431,29 +481,29 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
             }
         }
 
-        pbrShader_->setInt("useInstancing", 1);
+        cmd->setShaderInt(pbr, "useInstancing", 1);
         for (int lod = 0; lod < NUM_LODS; ++lod) {
             lodCounts_[lod] = static_cast<int>(lodBuckets[lod].size());
             visibleCount_ += lodCounts_[lod];
             if (lodBuckets[lod].empty()) continue;
 
-            sphereLODs_[lod].instanceBuffer->update(
-                lodBuckets[lod].data(),
-                lodBuckets[lod].size() * sizeof(InstanceData));
+            cmd->updateBuffer(sphereLODs_[lod].instanceBuffer.get(),
+                              lodBuckets[lod].data(),
+                              lodBuckets[lod].size() * sizeof(InstanceData));
 
-            ctx_->bindVertexInput(sphereLODs_[lod].vertexInput.get());
-            ctx_->drawIndexedInstanced(PrimitiveType::TriangleStrip,
+            cmd->bindVertexInput(sphereLODs_[lod].vertexInput.get());
+            cmd->drawIndexedInstanced(PrimitiveType::TriangleStrip,
                                        sphereLODs_[lod].indexCount,
                                        static_cast<int>(lodBuckets[lod].size()));
         }
-        pbrShader_->setInt("useInstancing", 0);
+        cmd->setShaderInt(pbr, "useInstancing", 0);
     } else {
-        pbrShader_->setInt("useInstancing", 0);
+        cmd->setShaderInt(pbr, "useInstancing", 0);
         for (int row = 0; row < gridRows; ++row) {
             float metallic = static_cast<float>(row) /
                              static_cast<float>(std::max(gridRows - 1, 1));
             if (!material.useTextures)
-                pbrShader_->setFloat("metallicValue", metallic);
+                cmd->setShaderFloat(pbr, "metallicValue", metallic);
 
             for (int col = 0; col < gridCols; ++col) {
                 glm::vec3 pos((col - gridCols / 2) * gridSpacing,
@@ -465,7 +515,7 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                 }
 
                 if (!material.useTextures)
-                    pbrShader_->setFloat("roughnessValue",
+                    cmd->setShaderFloat(pbr, "roughnessValue",
                         glm::clamp(static_cast<float>(col) /
                                    static_cast<float>(std::max(gridCols - 1, 1)),
                                    0.05f, 1.0f));
@@ -475,15 +525,18 @@ void PBRRenderer::renderScene(const Camera& camera, const PBRMaterial& material,
                 ++visibleCount_;
 
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), pos);
-                pbrShader_->setMat4("model", glm::value_ptr(model));
+                cmd->setShaderMat4(pbr, "model", glm::value_ptr(model));
                 glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(model)));
-                pbrShader_->setMat3("normalMatrix", glm::value_ptr(normalMat));
-                renderSphereGeometry(lod);
+                cmd->setShaderMat3(pbr, "normalMatrix", glm::value_ptr(normalMat));
+
+                cmd->bindVertexInput(sphereLODs_[lod].vertexInput.get());
+                cmd->drawIndexed(PrimitiveType::TriangleStrip,
+                                 sphereLODs_[lod].indexCount);
             }
         }
     }
 
-    ctx_->endTimerQuery(timerQuery_.get());
+    cmd->endTimerQuery(timerQuery_.get());
 }
 
 void PBRRenderer::renderSingleSphere(const Camera& camera, const PBRMaterial& material,
@@ -505,13 +558,23 @@ void PBRRenderer::renderSingleSphere(const Camera& camera, const PBRMaterial& ma
 
 void PBRRenderer::renderBackground(const Camera& camera)
 {
-    ctx_->bindShader(backgroundShader_.get());
+    if (!bgCmdList_) bgCmdList_ = device_->createCommandList();
+    bgCmdList_->reset();
+    recordBackground(bgCmdList_.get(), camera);
+    ctx_->submit(bgCmdList_.get());
+}
+
+void PBRRenderer::recordBackground(RHICommandList* cmd, const Camera& camera)
+{
+    RHIShader* bg = backgroundShader_.get();
+    cmd->bindShader(bg);
     glm::mat4 proj = projectionMatrix(camera);
     glm::mat4 view = camera.GetViewMatrix();
-    backgroundShader_->setMat4("projection", glm::value_ptr(proj));
-    backgroundShader_->setMat4("view", glm::value_ptr(view));
-    ctx_->bindTexture(0, envCubemap_.get());
-    renderCubeGeometry();
+    cmd->setShaderMat4(bg, "projection", glm::value_ptr(proj));
+    cmd->setShaderMat4(bg, "view",       glm::value_ptr(view));
+    cmd->bindTexture(0, envCubemap_.get());
+    cmd->bindVertexInput(cubeInput_.get());
+    cmd->draw(PrimitiveType::Triangles, 36);
 }
 
 // ============================================================

@@ -12,6 +12,7 @@
 #include "pbr_renderer.h"
 #include "scene_config.h"
 #include "path_utils.h"
+#include "rhi/render_thread.h"
 
 #include <iostream>
 #include <vector>
@@ -85,6 +86,7 @@ struct AppState {
     int   screenWidth = 1280, screenHeight = 720;
 
     bool      useInstancing = true;
+    bool      useThreadedRendering = false;
     PerfStats perf;
 
     RHIContext* ctx = nullptr;
@@ -301,6 +303,13 @@ static void drawUI(PBRRenderer& renderer, const ImGuiIO& io)
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "OFF (%d draw calls)",
                                p.visibleSpheres);
         }
+
+        ImGui::Checkbox("Threaded Rendering", &g_app.useThreadedRendering);
+        ImGui::SameLine();
+        if (g_app.useThreadedRendering)
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "worker record + main submit");
+        else
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "immediate");
     }
     ImGui::Separator();
 
@@ -510,6 +519,8 @@ int main(int argc, char** argv)
     renderer.init(device.get(), PathUtils::resolve(cfg.shaderDir));
     applyConfig(cfg, renderer);
 
+    RenderThread renderThread(device.get());
+
     g_app.screenWidth  = cfg.window.width;
     g_app.screenHeight = cfg.window.height;
     g_app.lastX = cfg.window.width / 2.0f;
@@ -548,15 +559,49 @@ int main(int argc, char** argv)
         for (auto& light : g_app.lights)
             light.color = lc * g_app.lightIntensity;
 
-        ctx->setViewport(0, 0, g_app.screenWidth, g_app.screenHeight);
-        ctx->clear(g_app.bgColor[0], g_app.bgColor[1], g_app.bgColor[2], 1.0f, 1.0f);
+        bool showBg = g_app.showBackground && renderer.iblReady();
 
-        renderer.renderScene(g_app.camera, g_app.material, g_app.lights,
-                             g_app.gridRows, g_app.gridCols, g_app.gridSpacing,
-                             g_app.gridVisible, g_app.useInstancing);
+        if (g_app.useThreadedRendering) {
+            renderer.updateTimerResult();
 
-        if (g_app.showBackground && renderer.iblReady())
-            renderer.renderBackground(g_app.camera);
+            auto recordFunc = [&](RHICommandList* cmd) {
+                cmd->setViewport(0, 0, g_app.screenWidth, g_app.screenHeight);
+                cmd->clear(g_app.bgColor[0], g_app.bgColor[1], g_app.bgColor[2], 1.0f, 1.0f);
+                renderer.recordScene(cmd, g_app.camera, g_app.material, g_app.lights,
+                                     g_app.gridRows, g_app.gridCols, g_app.gridSpacing,
+                                     g_app.gridVisible, g_app.useInstancing);
+                if (showBg) renderer.recordBackground(cmd, g_app.camera);
+            };
+
+            if (renderThread.completedFrames() == 0) {
+                // Frame 0 warmup — no previous frame to replay, stay synchronized.
+                //
+                //   Main  : kick() ──────> [worker records] ──> submit() ──> GL replay
+                //
+                renderThread.kick(recordFunc);
+                renderThread.submit(ctx);
+            } else {
+                // Frame 1+ — double-buffered: recording of frame N runs on the worker
+                // while the main thread replays frame N-1 on the GL thread.
+                //
+                //   Worker : ─── record(N) ──────────────────────────────>
+                //   Main   : kickAsync(N) ─> replayPrevious(N-1) ─> sync(N) ─> swapBuffers()
+                //                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                //                           overlap with recording ↑
+                //
+                renderThread.kickAsync(recordFunc);
+                renderThread.replayPrevious(ctx);   // overlaps with worker recording
+                renderThread.sync();                // wait for frame N if not done yet
+                renderThread.swapBuffers();         // promote write→read for next frame
+            }
+        } else {
+            ctx->setViewport(0, 0, g_app.screenWidth, g_app.screenHeight);
+            ctx->clear(g_app.bgColor[0], g_app.bgColor[1], g_app.bgColor[2], 1.0f, 1.0f);
+            renderer.renderScene(g_app.camera, g_app.material, g_app.lights,
+                                 g_app.gridRows, g_app.gridCols, g_app.gridSpacing,
+                                 g_app.gridVisible, g_app.useInstancing);
+            if (showBg) renderer.renderBackground(g_app.camera);
+        }
 
         // Update perf stats
         {

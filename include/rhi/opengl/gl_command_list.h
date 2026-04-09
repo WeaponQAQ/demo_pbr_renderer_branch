@@ -68,7 +68,7 @@ using RenderCommand = std::variant<
 >;
 
 // ============================================================
-//  GLCommandList — thread-safe command recording
+//  GLCommandList — single-thread recording, main-thread replay
 // ============================================================
 
 class GLCommandList final : public RHICommandList {
