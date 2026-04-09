@@ -13,4 +13,5 @@ vcpkg_installed/
 *.ilk
 *.log
 .cache/
+.cursor/
 compile_commands.json
