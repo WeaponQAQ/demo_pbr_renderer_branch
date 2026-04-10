@@ -1,0 +1,58 @@
+name: PBR Renderer
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      BUILD_TYPE: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msvc@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: latest
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -Type Directory -Path dist -Force | Out-Null
+          Copy-Item "build\Release\*.exe" -Destination dist -ErrorAction SilentlyContinue
+          Copy-Item "build\Release\*.dll" -Destination dist -ErrorAction SilentlyContinue
+          if (Test-Path "shaders") { Copy-Item "shaders" -Destination "dist\shaders" -Recurse -Force }
+          if (Test-Path "README.md") { Copy-Item "README.md" -Destination dist -Force }
+          if (Test-Path "scene_stress_test.json") { Copy-Item "scene_stress_test.json" -Destination dist -Force }
+          Compress-Archive -Path dist\* -DestinationPath dist\pbr-renderer-release.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbr-renderer-release
+          path: dist/pbr-renderer-release.zip
