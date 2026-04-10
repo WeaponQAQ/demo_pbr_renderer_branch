@@ -3,9 +3,13 @@ name: PBR Renderer
 on:
   push:
     branches: ["master"]
+    tags: ["v*"]
   pull_request:
     branches: ["master"]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -17,25 +21,37 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive   # vcpkg / imgui / stb are all submodules
 
-      - name: Setup MSVC
+      - name: Setup MSVC (cl)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           vs-version: "2022"
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: latest
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        # Reads vcpkg.json manifest automatically; falls back to classic mode if absent.
+        run: |
+          .\vcpkg\vcpkg.exe install `
+            glfw3:x64-windows `
+            glm:x64-windows `
+            assimp:x64-windows `
+            nlohmann-json:x64-windows
 
       - name: Configure
         shell: pwsh
+        # CMakeLists.txt already sets CMAKE_TOOLCHAIN_FILE from the submodule path,
+        # so we do NOT pass it again here to avoid conflicts.
         run: |
           cmake -S . -B build `
             -A x64 `
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake"
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
 
       - name: Build
         shell: pwsh
@@ -43,17 +59,25 @@ jobs:
 
       - name: Package
         shell: pwsh
+        # shaders/ resources/ scene*.json are already copied to build\Release\
+        # by the CMake POST_BUILD command, so we just zip that folder.
         run: |
-          New-Item -Type Directory -Path dist -Force | Out-Null
-          Copy-Item "build\Release\*.exe" -Destination dist -ErrorAction SilentlyContinue
-          Copy-Item "build\Release\*.dll" -Destination dist -ErrorAction SilentlyContinue
-          if (Test-Path "shaders") { Copy-Item "shaders" -Destination "dist\shaders" -Recurse -Force }
-          if (Test-Path "README.md") { Copy-Item "README.md" -Destination dist -Force }
-          if (Test-Path "scene_stress_test.json") { Copy-Item "scene_stress_test.json" -Destination dist -Force }
-          Compress-Archive -Path dist\* -DestinationPath dist\pbr-renderer-release.zip -Force
+          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          $zip = "pbr-renderer-$tag-win64.zip"
+          Compress-Archive -Path "build\Release\*" -DestinationPath $zip -Force
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: pbr-renderer-release
-          path: dist/pbr-renderer-release.zip
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true
