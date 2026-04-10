@@ -36,18 +36,10 @@ jobs:
 
       - name: Install vcpkg dependencies
         shell: pwsh
-        # Reads vcpkg.json manifest automatically; falls back to classic mode if absent.
-        run: |
-          .\vcpkg\vcpkg.exe install `
-            glfw3:x64-windows `
-            glm:x64-windows `
-            assimp:x64-windows `
-            nlohmann-json:x64-windows
+        run: .\vcpkg\vcpkg.exe install --triplet x64-windows
 
       - name: Configure
         shell: pwsh
-        # CMakeLists.txt already sets CMAKE_TOOLCHAIN_FILE from the submodule path,
-        # so we do NOT pass it again here to avoid conflicts.
         run: |
           cmake -S . -B build `
             -A x64 `
@@ -59,8 +51,6 @@ jobs:
 
       - name: Package
         shell: pwsh
-        # shaders/ resources/ scene*.json are already copied to build\Release\
-        # by the CMake POST_BUILD command, so we just zip that folder.
         run: |
           $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
           $zip = "pbr-renderer-$tag-win64.zip"

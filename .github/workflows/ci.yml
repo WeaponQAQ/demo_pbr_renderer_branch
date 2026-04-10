@@ -1,0 +1,78 @@
+name: PBR Renderer
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      BUILD_TYPE: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # vcpkg / imgui / stb are all submodules
+
+      - name: Setup MSVC (cl)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vs-version: "2022"
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        # Reads vcpkg.json manifest in project root; no package args needed in manifest mode.
+        run: .\vcpkg\vcpkg.exe install --triplet x64-windows
+
+      - name: Configure
+        shell: pwsh
+        # CMakeLists.txt already sets CMAKE_TOOLCHAIN_FILE from the submodule path,
+        # so we do NOT pass it again here to avoid conflicts.
+        run: |
+          cmake -S . -B build `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Package
+        shell: pwsh
+        # shaders/ resources/ scene*.json are already copied to build\Release\
+        # by the CMake POST_BUILD command, so we just zip that folder.
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          $zip = "pbr-renderer-$tag-win64.zip"
+          Compress-Archive -Path "build\Release\*" -DestinationPath $zip -Force
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbr-renderer-release
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true

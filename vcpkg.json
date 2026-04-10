@@ -1,7 +1,6 @@
 {
   "name": "pbr-renderer",
-  "version-string": "1.0.0",
-  "description": "PBR Renderer with ImGui and OpenGL",
+  "version": "1.0.0",
   "dependencies": [
     "glfw3",
     "glm",
