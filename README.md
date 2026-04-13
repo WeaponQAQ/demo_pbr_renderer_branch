@@ -1,16 +1,6 @@
 # PBR Renderer
 ![alt text](image.png)
 A Physically Based Rendering (PBR) demo built with OpenGL 3.3, ImGui, and Image-Based Lighting (IBL), following the [LearnOpenGL PBR tutorial](https://learnopengl.com/PBR/Theory).
-* [Example Forge Mod for Minecraft 1.7.10](#example-forge-mod-for-minecraft-1710)
-    * [Motivation](#motivation)
-    * [Help! I'm stuck!](#help-im-stuck)
-    * [Getting started](#getting-started)
-    * [Features](#features)
-    * [Files](#files)
-    * [Forge's Access Transformers](#forges-access-transformers)
-    * [Mixins](#mixins)
-    * [Advanced](#advanced)
-    * [Feedback wanted](#feedback-wanted)
 
 
 ## Features
